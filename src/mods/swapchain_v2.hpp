@@ -124,6 +124,9 @@ static bool force_screen_tearing = true;
 static bool swapchain_proxy_compatibility_mode = true;
 static bool swapchain_proxy_revert_state = false;
 static bool& use_device_proxy = utils::device_proxy::use_device_proxy;
+static reshade::api::device_api& proxy_device_api = utils::device_proxy::proxy_device_api;
+static bool& proxy_skip_host_present = utils::device_proxy::skip_host_present;
+static bool& proxy_present_do_not_wait = utils::device_proxy::proxy_present_do_not_wait;
 static bool& use_auto_cloning = utils::resource::upgrade::use_auto_cloning;
 static bool prevent_multiple_flip_swapchains_per_window = true;
 
@@ -158,7 +161,7 @@ static void DeviceProxyThread() {
   // Moved to utils::device_proxy
 }
 
-static ID3D11Device* GetDeviceProxy(renodx::utils::resource::ResourceInfo* host_resource_info, HWND hwnd = nullptr) {
+static IUnknown* GetDeviceProxy(renodx::utils::resource::ResourceInfo* host_resource_info, HWND hwnd = nullptr) {
   return renodx::utils::device_proxy::GetDeviceProxy(host_resource_info, hwnd);
 }
 
@@ -456,7 +459,9 @@ static void OnInitDevice(reshade::api::device* device) {
   data->expected_constant_buffer_index = expected_constant_buffer_index;
   data->expected_constant_buffer_space = expected_constant_buffer_space;
 
-  if (utils::device_proxy::UseProxyRequested()) {
+  // Only the proxy presentation device carries the proxy pass settings. The
+  // host and the D3D12 transport bridge must not overwrite them.
+  if (utils::device_proxy::UseProxyRequested() && utils::device_proxy::IsCreatingProxyDevice()) {
     renodx::utils::draw::SwapchainProxyPass proxy_settings;
     proxy_settings.vertex_shader = data->swap_chain_proxy_vertex_shader;
     proxy_settings.pixel_shader = data->swap_chain_proxy_pixel_shader;
@@ -679,6 +684,16 @@ static bool OnCreateSwapchain(reshade::api::swapchain_desc& desc, void* hwnd) {
     }
   } else if (device_api == reshade::api::device_api::opengl) {
     // Nothing for now
+  }
+  if (utils::device_proxy::UseProxyRequested()) {
+    // The proxy is the visible presenter; carry the requested vsync over to
+    // it. D3D9 treats the default interval as one vblank.
+    const uint32_t requested_sync_interval =
+        (desc.sync_interval == UINT32_MAX) ? 1u : desc.sync_interval;
+    utils::device_proxy::SetProxySyncInterval(requested_sync_interval);
+    std::stringstream s;
+    s << "mods::swapchain::OnCreateSwapchain(proxy sync interval: " << requested_sync_interval << ")";
+    reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
   if (prevent_full_screen || utils::device_proxy::UseProxyRequested()) {
     if (desc.fullscreen_state) {
@@ -946,10 +961,10 @@ static void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) 
   auto* data = renodx::utils::data::Get<DeviceData>(device);
   if (data == nullptr) return;
 
-  const auto& desc = data->swapchain_desc;
-  if (hwnd != nullptr && !resize && utils::swapchain::IsDXGI(swapchain)
-      && (desc.present_mode == static_cast<uint32_t>(DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL)
-          || desc.present_mode == static_cast<uint32_t>(DXGI_SWAP_EFFECT_FLIP_DISCARD))) {
+  // Erase regardless of the recorded desc: proxy device swapchains are
+  // inserted before OnInitSwapchain aborts and never record a desc, which
+  // left a stale entry and a spurious "flip swapchain already exists".
+  if (hwnd != nullptr && !resize && utils::swapchain::IsDXGI(swapchain)) {
     if (auto pair = flip_swapchains_by_window.find(hwnd);
         pair != flip_swapchains_by_window.end()) {
       pair->second.erase(swapchain);

@@ -29,6 +29,28 @@
 
 namespace renodx::utils::platform {
 
+// Process-heap allocation honoring an alignment. HeapAlloc only guarantees
+// 8-byte alignment on 32-bit and 16-byte on 64-bit, which is not enough for
+// cache-line aligned or SIMD members. The block is over-allocated and the
+// original pointer is stored just before the aligned address, so any module
+// sharing the process heap can free it.
+inline void* AlignedProcessHeapAlloc(std::size_t size, std::size_t alignment, bool zero) {
+  alignment = (std::max)(alignment, alignof(std::max_align_t));
+  const std::size_t total = size + alignment + sizeof(void*);
+  auto* raw = ::HeapAlloc(::GetProcessHeap(), zero ? HEAP_ZERO_MEMORY : 0u, total);
+  if (raw == nullptr) return nullptr;
+  auto address = reinterpret_cast<std::uintptr_t>(raw) + sizeof(void*);
+  address = (address + alignment - 1u) & ~(static_cast<std::uintptr_t>(alignment) - 1u);
+  auto* aligned = reinterpret_cast<void*>(address);
+  static_cast<void**>(aligned)[-1] = raw;
+  return aligned;
+}
+
+inline void AlignedProcessHeapFree(void* aligned) {
+  if (aligned == nullptr) return;
+  ::HeapFree(::GetProcessHeap(), 0, static_cast<void**>(aligned)[-1]);
+}
+
 template <typename T>
 struct ProcessAllocator {
   using value_type = T;
@@ -45,7 +67,7 @@ struct ProcessAllocator {
       throw std::bad_array_new_length();
     }
 
-    auto* storage = static_cast<T*>(::HeapAlloc(::GetProcessHeap(), 0, count * sizeof(T)));
+    auto* storage = static_cast<T*>(AlignedProcessHeapAlloc(count * sizeof(T), alignof(T), false));
     if (storage == nullptr) {
       throw std::bad_alloc();
     }
@@ -54,8 +76,7 @@ struct ProcessAllocator {
 
   void deallocate(T* storage, std::size_t count) noexcept {  // NOLINT(readability-identifier-naming)
     (void)count;
-    if (storage == nullptr) return;
-    ::HeapFree(::GetProcessHeap(), 0, storage);
+    AlignedProcessHeapFree(storage);
   }
 };
 
@@ -75,7 +96,9 @@ inline bool operator!=(const ProcessAllocator<T>& left, const ProcessAllocator<U
 
 template <typename T, typename... Args>
 inline T* CreateSharedObject(Args&&... args) {
-  auto* storage = static_cast<T*>(::HeapAlloc(::GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(T)));
+  // Over-aligned types (cache-line aligned hash map submaps, SIMD members)
+  // need more than the 8 bytes HeapAlloc guarantees on 32-bit builds.
+  auto* storage = static_cast<T*>(AlignedProcessHeapAlloc(sizeof(T), alignof(T), true));
   assert(storage != nullptr);
   if (storage == nullptr) return nullptr;
 
@@ -87,7 +110,7 @@ inline void DeleteSharedObject(T* object) {
   if (object == nullptr) return;
 
   object->~T();
-  ::HeapFree(::GetProcessHeap(), 0, object);
+  AlignedProcessHeapFree(object);
 }
 
 template <typename T>

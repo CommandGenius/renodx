@@ -1,0 +1,10 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "nfsmw05",
+  "title": "Need for Speed: Most Wanted (2005)",
+  "deploy": {
+    "architecture": [
+      "x86"
+    ]
+  }
+}
