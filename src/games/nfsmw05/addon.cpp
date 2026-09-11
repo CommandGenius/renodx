@@ -2330,7 +2330,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         // The proxy chain owns the game window: the game's own D3D9 present is
         // skipped at the vtable so DWM sees a single flip-model presenter.
         renodx::mods::swapchain::use_device_proxy = true;
-        renodx::mods::swapchain::proxy_device_api = reshade::api::device_api::d3d12;
+        renodx::mods::swapchain::proxy_device_api = reshade::api::device_api::d3d11;
         renodx::mods::swapchain::proxy_skip_host_present = true;
         renodx::mods::swapchain::swap_chain_proxy_shaders = {
             {
