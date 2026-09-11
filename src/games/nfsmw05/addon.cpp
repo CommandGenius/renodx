@@ -1,4 +1,3 @@
-
 #define ImTextureID ImU64
 
 #define DEBUG_LEVEL_0
