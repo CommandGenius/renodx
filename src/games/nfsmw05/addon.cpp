@@ -1,7 +1,3 @@
-/*
- * Copyright (C) 2024 Carlos Lopez
- * SPDX-License-Identifier: MIT
- */
 
 #define ImTextureID ImU64
 
@@ -54,12 +50,8 @@ float current_settings_mode = 0;
 
 constexpr bool DX9_READBACK_FIX_ENABLED = true;
 
-// RenoDX's scRGB/HDR clone is normally linear. Enable this to hand the game a
-// conventional SDR/screenshot-like nonlinear representation.
 constexpr bool DX9_READBACK_ENCODE_SRGB = true;
 
-// Preserve the source alpha by default. Change to true only if the game's
-// readback consumer requires an opaque X8/A8 surface.
 constexpr bool DX9_READBACK_FORCE_OPAQUE_ALPHA = false;
 
 thread_local bool g_inside_dx9_replacement_copy = false;
@@ -91,9 +83,6 @@ struct DX9CopyEndpoint {
   bool clone_enabled = false;
 };
 
-// Fast reverse lookup for callbacks that arrive with the clone handle itself.
-// The key is the FP16 clone handle. The cached original is validated against
-// RenoDX live tracking before it is used, so stale mappings are discarded.
 struct DX9CloneLookupCacheEntry {
   reshade::api::resource original = {0u};
 };
@@ -102,9 +91,6 @@ std::mutex g_dx9_clone_lookup_cache_mutex;
 std::unordered_map<uint64_t, DX9CloneLookupCacheEntry>
     g_dx9_clone_lookup_cache;
 
-// Reusable CPU-visible FP16 staging surface for GetRenderTargetData.
-// The old implementation allocated and destroyed this surface for every
-// incompatible FP16 -> 8-bit readback.
 struct DX9ReadbackStagingCache {
   reshade::api::device* device = nullptr;
   reshade::api::resource resource = {0u};
@@ -193,7 +179,6 @@ bool TryResolveDX9CloneFromCache(
     return true;
   }
 
-  // Resource was destroyed/recreated or the handle was reused.
   {
     std::scoped_lock lock(g_dx9_clone_lookup_cache_mutex);
     g_dx9_clone_lookup_cache.erase(
@@ -240,9 +225,6 @@ bool EnsureDX9ReadbackStaging(
     return true;
   }
 
-  // Same live D3D9 device but dimensions/format changed: release the old cached
-  // surface before replacing it. If the device itself changed, simply forget the
-  // old handle; the old D3D9 device owns and reclaims its resources on teardown.
   if (cache.device == device && cache.resource.handle != 0u) {
     device->destroy_resource(cache.resource);
   }
@@ -284,8 +266,6 @@ void ClearDX9ReadbackOptimizationCaches() {
     g_dx9_clone_lookup_cache.clear();
   }
 
-  // Do not call through a possibly-destroyed D3D9 device from DLL detach.
-  // The device owns the cached staging allocation and frees it during teardown.
   g_dx9_readback_staging_cache = {};
 }
 
@@ -349,9 +329,6 @@ DX9CopyEndpoint ResolveDX9CopyEndpoint(
             endpoint.clone_enabled = info.clone_enabled;
           });
 
-  // Any normal original-resource lookup gives us the clone handle essentially
-  // for free. Remember that pair now so a later callback that arrives with the
-  // FP16 clone handle can resolve it without scanning every tracked resource.
   RememberDX9CloneMapping(endpoint);
 
   const bool may_be_clone_handle =
@@ -361,7 +338,6 @@ DX9CopyEndpoint ResolveDX9CopyEndpoint(
 
   if (may_be_clone_handle
       && (!endpoint.has_clone || endpoint.input_is_clone)) {
-    // Fast path: validate the cached original through RenoDX's direct live lookup.
     if (TryResolveDX9CloneFromCache(
             device,
             input,
@@ -370,7 +346,6 @@ DX9CopyEndpoint ResolveDX9CopyEndpoint(
       return endpoint;
     }
 
-    // Slow path only for the first encounter of a clone or after invalidation.
     bool found_parent = false;
 
     renodx::utils::resource::ForEachResourceInfo(
@@ -464,25 +439,6 @@ bool IsCPUVisibleReadbackHeap(reshade::api::memory_heap heap) {
       || heap == reshade::api::memory_heap::cpu_only;
 }
 
-// ============================================================================
-// D3D9 GPU HDR -> SDR readback blit
-// ============================================================================
-//
-// The game asks D3D9 GetRenderTargetData to copy what it thinks is its original
-// 8-bit render target into a CPU-visible surface. RenoDX resource cloning means
-// the current image may instead live in an R16G16B16A16_FLOAT clone.
-//
-// The old compatibility fallback solved that by reading FP16 back to the CPU and
-// converting every pixel there. That is correct, but the synchronous readback +
-// per-pixel half conversion + sRGB pow() work can create large frametime spikes.
-//
-// This path keeps resource cloning intact and moves the conversion back to the
-// GPU:
-//
-//   FP16 clone -> fullscreen ps_3_0 blit -> original 8-bit render target
-//              -> normal same-format GetRenderTargetData copy -> game surface
-//
-// The existing CPU converter remains below this path as a correctness fallback.
 
 constexpr bool DX9_GPU_READBACK_BLIT_ENABLED = true;
 
@@ -499,14 +455,12 @@ struct DX9GPUReadbackBlitVertex {
 };
 
 struct DX9GPUReadbackBlitCache {
-  IDirect3DDevice9* device = nullptr;  // Borrowed; owned by ReShade/D3D9.
+  IDirect3DDevice9* device = nullptr;
   IDirect3DVertexShader9* vertex_shader = nullptr;
   IDirect3DPixelShader9* pixel_shader = nullptr;
   IDirect3DVertexDeclaration9* vertex_declaration = nullptr;
   IDirect3DStateBlock9* state_block = nullptr;
 
-  // Only needed when the FP16 clone is a plain render-target surface rather than
-  // an IDirect3DTexture9. It is reused instead of allocated on every readback.
   IDirect3DTexture9* source_scratch_texture = nullptr;
   uint32_t source_scratch_width = 0u;
   uint32_t source_scratch_height = 0u;
@@ -562,7 +516,6 @@ void OnDX9ReadbackDestroySwapchain(
   (void)resize;
   if (swapchain == nullptr) return;
 
-  // D3D9 Reset requires addon-owned default-pool resources to be released.
   DestroyDX9GPUReadbackBlitCache(swapchain->get_device());
 }
 
@@ -668,10 +621,6 @@ bool TryAcquireDX9TextureContainer(
   return true;
 }
 
-// Self-contained D3D9 readback blit shaders.
-// These are compiled once on demand through d3dcompiler_47.dll (or an older
-// compatible Windows compiler DLL) so this addon does not depend on RenoDX's
-// generated __dx9_readback_blit_* embed symbols.
 static constexpr char DX9_READBACK_BLIT_VERTEX_HLSL[] = R"hlsl(
 float4 gInvTargetSize : register(c0);
 
@@ -945,8 +894,6 @@ bool PrepareDX9GPUReadbackSourceTextureLocked(
     ScopedDX9NativeTexture& direct_texture) {
   texture_out = nullptr;
 
-  // Fastest case: RenoDX clone is already a texture (or a surface belonging to
-  // one), so it can be sampled directly with no extra copy.
   if (TryAcquireDX9TextureContainer(
           source,
           source_desc,
@@ -955,9 +902,6 @@ bool PrepareDX9GPUReadbackSourceTextureLocked(
     return texture_out != nullptr;
   }
 
-  // D3D9 can also expose swapchain/render-target clones as plain surfaces. Those
-  // cannot be sampled by ps_3_0, so copy the FP16 surface into one reusable FP16
-  // render-target texture, then sample that texture.
   if (!EnsureDX9GPUReadbackScratchTextureLocked(
           device,
           source_desc.texture.width,
@@ -1143,9 +1087,6 @@ bool BlitDX9HDRCloneToOriginalSDR(
     return false;
   }
 
-  // Native calls bypass ReShade's state tracker, so explicitly remove any old
-  // texture bindings that could alias the original SDR render target. The state
-  // block restores them after the blit.
   for (DWORD stage = 0u; stage < 16u; ++stage) {
     native_device->SetTexture(stage, nullptr);
   }
@@ -1194,8 +1135,6 @@ bool BlitDX9HDRCloneToOriginalSDR(
           | D3DCOLORWRITEENABLE_BLUE
           | D3DCOLORWRITEENABLE_ALPHA);
 
-  // The pixel shader performs the nonlinear encoding explicitly so the target
-  // should store its output literally, regardless of any game's prior sRGB state.
   native_device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
 
   native_device->SetSamplerState(0u, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
@@ -1298,10 +1237,6 @@ bool TryConvertDX9FloatReadbackWithGPUBlit(
     return false;
   }
 
-  // The original 8-bit target now contains the current SDR representation.
-  // Finish with native GetRenderTargetData, which is the D3D9 operation the game
-  // originally wanted and avoids sending this replacement copy back through the
-  // ReShade callback stack.
   auto* native_device =
       reinterpret_cast<IDirect3DDevice9*>(device->get_native());
   if (native_device == nullptr) return false;
@@ -1355,7 +1290,6 @@ float HalfToFloat(uint16_t value) {
   float result = 0.0f;
 
   if (exponent == 0u) {
-    // Half subnormal: mantissa / 1024 * 2^-14 = mantissa * 2^-24.
     result = std::ldexp(static_cast<float>(mantissa), -24);
   } else if (exponent == 0x1Fu) {
     if (mantissa == 0u) {
@@ -1387,10 +1321,6 @@ float LinearToSRGB(float linear) {
   return 1.055f * std::pow(linear, 1.0f / 2.4f) - 0.055f;
 }
 
-// Small cached transfer-function LUT used only by the CPU readback fallback.
-// The GPU blit is preferred; if it cannot be used, this removes millions of
-// per-pixel std::pow() calls from a 4K FP16 -> SDR readback. 4096 entries are
-// enough for the 8-bit destination and cost only 4 KiB.
 const std::array<uint8_t, 4096u>& GetDX9SRGBEncodeLUT() {
   static const std::array<uint8_t, 4096u> table = []() {
     std::array<uint8_t, 4096u> result = {};
@@ -1489,7 +1419,6 @@ bool TryChainDX9CopyResource(
 
   if (selected_source.handle == 0u || selected_dest.handle == 0u) return false;
 
-  // Nothing to replace if the application already supplied both clone handles.
   if (selected_source.handle == source_endpoint.input.handle
       && selected_dest.handle == dest_endpoint.input.handle) {
     return false;
@@ -1594,9 +1523,6 @@ bool TryConvertDX9FloatReadbackToSDR(
     return false;
   }
 
-  // GetRenderTargetData is a whole-surface operation, so make a matching
-  // CPU-visible float surface first. Its format matches the cloned source,
-  // allowing D3D9 to perform the GPU readback legally.
   reshade::api::resource_desc staging_desc = float_source_desc;
   staging_desc.heap = reshade::api::memory_heap::gpu_to_cpu;
   staging_desc.usage = reshade::api::resource_usage::copy_dest;
@@ -1607,8 +1533,6 @@ bool TryConvertDX9FloatReadbackToSDR(
 
   reshade::api::resource staging = {0u};
 
-  // Serialize use of the single cached staging resource. D3D9 is normally an
-  // immediate-context API, but this also keeps multi-threaded callback use safe.
   std::scoped_lock staging_lock(g_dx9_readback_staging_mutex);
 
   if (!EnsureDX9ReadbackStaging(
@@ -1731,8 +1655,6 @@ bool OnDX9CopyResource(
   const DX9CopyEndpoint dest_endpoint =
       ResolveDX9CopyEndpoint(device, dest);
 
-  // First handle normal GPU scratch copies where both original resources were
-  // cloned/upgraded. This is the D3D9 equivalent of resource chaining.
   if (TryChainDX9CopyResource(
           cmd_list,
           source_endpoint,
@@ -1740,15 +1662,8 @@ bool OnDX9CopyResource(
     return true;
   }
 
-  // Then handle GetRenderTargetData. If ReShade supplied the clone handle
-  // directly and RenoDX still has a matching original SDR surface, prefer that
-  // zero-conversion path before falling back to CPU float16 -> 8-bit conversion.
-  // ResolveDX9CopyEndpoint already queried this descriptor. Reuse it instead of
-  // asking the resource tracker/device for the same description a second time.
   const reshade::api::resource_desc& dest_desc = dest_endpoint.input_desc;
 
-  // Preferred path: refresh the game's original 8-bit resource from the FP16
-  // clone with a GPU fullscreen blit, then issue a normal same-format readback.
   if (TryConvertDX9FloatReadbackWithGPUBlit(
           cmd_list,
           source_endpoint,
@@ -1757,8 +1672,6 @@ bool OnDX9CopyResource(
     return true;
   }
 
-  // Existing zero-conversion redirect remains as a compatibility fast path for
-  // cases where the original SDR resource is already current.
   if (TryRedirectDX9CloneReadbackToOriginal(
           cmd_list,
           source_endpoint,
@@ -1767,7 +1680,6 @@ bool OnDX9CopyResource(
     return true;
   }
 
-  // Last resort: the original cached CPU FP16 -> SDR conversion.
   if (TryConvertDX9FloatReadbackToSDR(
           cmd_list,
           source_endpoint,
@@ -1819,8 +1731,6 @@ bool OnDX9CopyTextureRegion(
   const reshade::api::resource_desc selected_dest_desc =
       SelectCloneDescForCopy(dest_endpoint);
 
-  // The original source/destination boxes remain valid only when cloning kept
-  // each resource's dimensions unchanged.
   if (!SameTextureExtent(
           source_endpoint.original_desc,
           selected_source_desc)
@@ -1947,12 +1857,17 @@ renodx::utils::settings::Settings settings = {
         .key = "ToneMapType",
         .binding = &shader_injection.tone_map_type,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 3.f,
+        .default_value = 2.f,
         .can_reset = true,
         .label = "Tone Mapper",
         .section = "Tone Mapping",
         .tooltip = "Sets the tone mapper type",
-        .labels = {"Vanilla", "None", "ACES", "RenoDRT"},
+        .labels = {"Vanilla", "None", "RenoDRT"},
+        .parse = [](float value) {
+          if (value < 0.5f) return 0.f;
+          if (value < 1.5f) return 1.f;
+          return 3.f;
+        },
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
@@ -2251,33 +2166,9 @@ renodx::utils::settings::Settings settings = {
 };
 
 const std::unordered_map<std::string, reshade::api::format> UPGRADE_TARGETS = {
-    /* {"R8G8B8A8_TYPELESS", reshade::api::format::r8g8b8a8_typeless},
-    {"B8G8R8A8_TYPELESS", reshade::api::format::b8g8r8a8_typeless},
-    {"R8G8B8A8_UNORM", reshade::api::format::r8g8b8a8_unorm},
-    {"B8G8R8A8_UNORM", reshade::api::format::b8g8r8a8_unorm},
-    {"R8G8B8A8_SNORM", reshade::api::format::r8g8b8a8_snorm},
-    {"R8G8B8A8_UNORM_SRGB", reshade::api::format::r8g8b8a8_unorm_srgb},
-    {"B8G8R8A8_UNORM_SRGB", reshade::api::format::b8g8r8a8_unorm_srgb},
-    {"R10G10B10A2_TYPELESS", reshade::api::format::r10g10b10a2_typeless},
-    {"R10G10B10A2_UNORM", reshade::api::format::r10g10b10a2_unorm},
-    {"B10G10R10A2_UNORM", reshade::api::format::b10g10r10a2_unorm},
-    {"R11G11B10_FLOAT", reshade::api::format::r11g11b10_float},
-    {"R16G16B16A16_TYPELESS", reshade::api::format::r16g16b16a16_typeless}, */
 };
 
 void OnPresetOff() {
-  //   renodx::utils::settings::UpdateSetting("toneMapType", 0.f);
-  //   renodx::utils::settings::UpdateSetting("toneMapPeakNits", 203.f);
-  //   renodx::utils::settings::UpdateSetting("toneMapGameNits", 203.f);
-  //   renodx::utils::settings::UpdateSetting("toneMapUINits", 203.f);
-  //   renodx::utils::settings::UpdateSetting("toneMapGammaCorrection", 0);
-  //   renodx::utils::settings::UpdateSetting("colorGradeExposure", 1.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeHighlights", 50.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeShadows", 50.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeContrast", 50.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeSaturation", 50.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeLUTStrength", 100.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeLUTScaling", 0.f);
 }
 
 const auto UPGRADE_TYPE_NONE = 0.f;
@@ -2303,7 +2194,7 @@ void OnPresent(reshade::api::command_queue* queue,
 
 bool initialized = false;
 
-}  // namespace
+}
 
 extern "C" __declspec(dllexport) constexpr const char* NAME = "RenoDX";
 extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION = "RenoDX Need for Speed: Most Wanted (2005)";
@@ -2324,11 +2215,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         renodx::mods::swapchain::expected_constant_buffer_space = 50;
         renodx::mods::swapchain::use_resource_cloning = true;
         renodx::mods::swapchain::set_color_space = false;
-        // D3D9 cannot present HDR itself. The device proxy presents through a
-        // D3D12 device and swapchain (a D3D11 device bridges the shared
-        // frame). The proxy shader pair is selected by the proxy API.
-        // The proxy chain owns the game window: the game's own D3D9 present is
-        // skipped at the vtable so DWM sees a single flip-model presenter.
         renodx::mods::swapchain::use_device_proxy = true;
         renodx::mods::swapchain::proxy_device_api = reshade::api::device_api::d3d11;
         renodx::mods::swapchain::proxy_skip_host_present = true;
@@ -2406,15 +2292,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
               .on_change_value = [](float previous, float current) {
                 bool is_hdr10 = current == 4;
                 shader_injection.swap_chain_encoding_color_space = (is_hdr10 ? 1.f : 0.f);
-                // return void
               },
               .is_global = true,
               .is_visible = []() { return current_settings_mode >= 2; },
           };
           renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
           bool is_hdr10 = setting->GetValue() == 4;
-          // Selects the proxy output target (RGB10A2/HDR10 or RGBA16F/scRGB).
-          // The D3D9 host swapchain is never resized or color-space switched.
           renodx::mods::swapchain::SetUseHDR10(is_hdr10);
           shader_injection.swap_chain_encoding_color_space = is_hdr10 ? 1.f : 0.f;
           settings.push_back(setting);
@@ -2492,9 +2375,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           }
         }
 
-        // Upgrade only render-target resources and keep resource-view cloning
-        // enabled so clears, RTVs and SRV variants continue to reference the same
-        // upgraded resource.
 
         const reshade::api::format scene_intermediate_formats[] = {
             reshade::api::format::r8g8b8a8_unorm,
@@ -2506,11 +2386,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         };
 
         const float scene_intermediate_aspect_ratios[] = {
-            16.f / 9.f,   // Standard widescreen
+            16.f / 9.f,
             16.f / 10.f,
-            24.f / 10.f,  // 3840x1600
-            43.f / 18.f,  // 3440x1440
-            64.f / 27.f,  // 5120x2160
+            24.f / 10.f,
+            43.f / 18.f,
+            64.f / 27.f,
         };
 
         for (const auto old_format : scene_intermediate_formats) {
@@ -2529,9 +2409,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           }
         }
 
-        // D3D9 copy/readback interception. These callbacks are ignored for the
-        // D3D11 display-proxy device and are recursion-guarded internally.
-        // Release cached default-pool blit objects before Reset/device teardown.
         reshade::register_event<reshade::addon_event::destroy_device>(
             OnDX9ReadbackDestroyDevice);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(
@@ -2567,9 +2444,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   renodx::mods::swapchain::Use(fdw_reason, &shader_injection);
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
 
-  // Keep the ReShade add-on registered until all RenoDX modules have processed
-  // DLL_PROCESS_DETACH. Unregistering it earlier makes their event cleanup fail
-  // (the BO1 log showed dozens of "Could not find associated add-on" errors).
   if (fdw_reason == DLL_PROCESS_DETACH) {
     reshade::unregister_addon(h_module);
   }

@@ -1,17 +1,5 @@
 #include "./shared.h"
 
-// Need for Speed: Most Wanted (2005) full-screen brightness / gamma curve.
-// Translated from 0xB74BDC25.ps_3_0.cso (1930 instruction slots).
-//
-// The original is one texture read followed by a 1530-way cmp chain, which is
-// how the 2005 compiler lowers a dynamically indexed 256-entry table on
-// ps_3_0. Emulating the bytecode for every input value recovers the table
-// below; all three channels use the same curve, the output alpha is 1, and the
-// lookup is linearly interpolated between neighbouring entries:
-//
-//   s   = saturate(c) * 255
-//   out = lerp(LUT[floor(s)], LUT[floor(s) + 1], frac(s))
-
 sampler2D InputTex : register(s0);
 
 static const float LUT[256] = {
@@ -52,11 +40,6 @@ static const float LUT[256] = {
 float3 SampleCurve(float3 c) {
   float3 s = c * 255.f;
 
-  // The source is an 8-bit texture, so s sits exactly on an integer for every
-  // pixel. Take the floor with a small bias and clamp the fraction so a fused
-  // multiply-add landing a hair below the integer cannot pick the entry one
-  // step low. The bias is far below one 8-bit step, so it never changes which
-  // pair of entries a genuinely fractional value blends between.
   float3 fl = floor(s + 1e-4f);
   float3 f = saturate(s - fl);
   int3 i = (int3)fl;
@@ -68,31 +51,12 @@ float3 SampleCurve(float3 c) {
 }
 
 float4 main(float2 uv : TEXCOORD0) : COLOR0 {
-  float4 c = tex2D(InputTex, uv);                 // texld r0, v0, s0
+  float4 c = tex2D(InputTex, uv);
 
-  // RenoDX: the input is the visual treatment's intermediate output, which is
-  // scaled by game nits over UI nits before encoding. Applying the curve to that
-  // directly would move the scene along the curve whenever the UI brightness
-  // changed. Unwind the intermediate encoding and scaling first, go back to the
-  // game's own gamma space, apply the curve there exactly as the original did,
-  // then re-encode so the swap chain pass sees the same intermediate format.
-  //
-  // The RenoDX Invert/RenderIntermediatePass helpers use [branch] flow control.
-  // Combined with the 256-way compare chain that the table lookup lowers to,
-  // that exceeds the 32 temporaries ps_3_0 allows. The same math is written
-  // here with selects instead, which compile to cmp and keep the register
-  // footprint flat. Intermediate encodings: 0 none, 1 sRGB, 2 gamma 2.2,
-  // 3 gamma 2.4. Gamma correction: 0 off, 1 gamma 2.2, 2 gamma 2.4.
   const float encoding = RENODX_INTERMEDIATE_ENCODING;
   const float correction = RENODX_GAMMA_CORRECTION;
   const float scaling = RENODX_DIFFUSE_WHITE_NITS / RENODX_GRAPHICS_WHITE_NITS;
 
-  // Bound the input without min/max: those lower to SPIR-V ops that are
-  // undefined for NaN and pass it through on some GPUs. A comparison is false
-  // for NaN, so a select on one always lands on the finite fallback. The bound
-  // and the fallback differ slightly so fxc cannot fold the select back into
-  // min/max. 64.0 in the intermediate encoding is far beyond any headroom the
-  // visual treatment can produce.
   float3 encoded = c.rgb;
   encoded = (encoded > -1e-4f) ? encoded : 0.f;
   encoded = (encoded < 64.f) ? encoded : 63.99f;
@@ -108,14 +72,10 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0 {
       : decoded;
   float3 game_gamma = renodx::color::gamma::Encode(max(linear_color, 0.f), 2.2f);
 
-  // The original saturated here, which would clip everything above 1.0. Apply
-  // the curve to the SDR range and carry the HDR excess through unchanged. The
-  // curve ends at LUT[255] == 1.0, so the join at 1.0 is continuous.
-  float3 sdr = saturate(game_gamma);              // mov_sat r0.xyz, r0
+  float3 sdr = saturate(game_gamma);
   float3 excess = game_gamma - sdr;
   float3 curved = SampleCurve(sdr) + excess;
 
-  // Re-encode exactly the way RenderIntermediatePass does.
   float3 out_linear = renodx::color::gamma::Decode(curved, 2.2f);
   out_linear =
       (correction == 1.f) ? renodx::color::correct::GammaSafe(out_linear, false, 2.2f)
@@ -128,12 +88,6 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0 {
       : (encoding == 3.f) ? renodx::color::gamma::Encode(out_linear, 2.4f)
       : out_linear;
 
-  // fxc places its own literal constants in any register it thinks is free,
-  // including unread members of the injection array. RenoDX writes the
-  // injection block into c50-c58 at draw time, which then corrupts those
-  // literals. Touching one component of every injection register keeps the
-  // whole range reserved. The guard sum is folded into alpha in a way that is
-  // exactly 1.0 for any finite values and cannot be constant-folded away.
   float guard = 0.f;
   [unroll]
   for (int k = 0; k < 9; ++k) {
@@ -142,6 +96,6 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0 {
 
   float4 o;
   o.rgb = out_encoded;
-  o.a = saturate(1.f + guard * 1e-30f);           // mov oC0.w, c0.y
+  o.a = saturate(1.f + guard * 1e-30f);
   return o;
 }
