@@ -29,11 +29,6 @@
 
 namespace renodx::utils::platform {
 
-// Process-heap allocation honoring an alignment. HeapAlloc only guarantees
-// 8-byte alignment on 32-bit and 16-byte on 64-bit, which is not enough for
-// cache-line aligned or SIMD members. The block is over-allocated and the
-// original pointer is stored just before the aligned address, so any module
-// sharing the process heap can free it.
 inline void* AlignedProcessHeapAlloc(std::size_t size, std::size_t alignment, bool zero) {
   alignment = (std::max)(alignment, alignof(std::max_align_t));
   const std::size_t total = size + alignment + sizeof(void*);
@@ -96,8 +91,6 @@ inline bool operator!=(const ProcessAllocator<T>& left, const ProcessAllocator<U
 
 template <typename T, typename... Args>
 inline T* CreateSharedObject(Args&&... args) {
-  // Over-aligned types (cache-line aligned hash map submaps, SIMD members)
-  // need more than the 8 bytes HeapAlloc guarantees on 32-bit builds.
   auto* storage = static_cast<T*>(AlignedProcessHeapAlloc(sizeof(T), alignof(T), true));
   assert(storage != nullptr);
   if (storage == nullptr) return nullptr;

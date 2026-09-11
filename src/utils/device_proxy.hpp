@@ -13,7 +13,6 @@
 #include <windef.h>
 #include <windows.h>
 
-#include <array>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -57,48 +56,22 @@ static bool device_proxy_wait_idle_source = false;
 static bool device_proxy_wait_idle_destination = false;
 static reshade::api::resource last_device_proxy_shared_resource = {0u};
 
-// Presentation API of the proxy. D3D11 presents directly from the proxy
-// device. D3D12 keeps a D3D11 device as a transport bridge (a D3D9 host can
-// only share legacy handles while D3D12 can only open NT handles) and presents
-// from a D3D12 device and queue. Select this before the first host present.
-static reshade::api::device_api proxy_device_api = reshade::api::device_api::d3d11;
-
 static thread_local bool is_creating_proxy_device = false;
-static thread_local bool is_creating_bridge_device = false;
 static thread_local bool is_creating_proxy_swapchain = false;
 
 static IDXGISwapChain1* proxy_swap_chain = nullptr;
-// D3D11 proxy device, or the D3D11 transport bridge when presenting through D3D12.
 static ID3D11Device* proxy_device = nullptr;
 static ID3D11DeviceContext* proxy_device_context = nullptr;
-static ID3D12Device* proxy_device_12 = nullptr;
-static ID3D12CommandQueue* proxy_command_queue = nullptr;
 static reshade::api::device* proxy_device_reshade = nullptr;
 static reshade::api::device* proxied_device_reshade = nullptr;
-static reshade::api::device* bridge_device_reshade = nullptr;
-static reshade::api::command_queue* bridge_queue_reshade = nullptr;
 static reshade::api::swapchain* proxy_swapchain_reshade = nullptr;
 static reshade::api::resource proxy_device_resource = {0u};
-// Bridge (D3D11) to proxy (D3D12) synchronization. Falls back to a bridge
-// wait-idle when shared NT fences are unavailable.
-static reshade::api::fence transport_fence_bridge = {0u};
-static reshade::api::fence transport_fence_proxy = {0u};
-static uint64_t transport_fence_value = 0u;
-static bool transport_fence_unavailable_logged = false;
-
-inline bool UsingD3D12Proxy() {
-  return proxy_device_api == reshade::api::device_api::d3d12;
-}
-
-static IUnknown* GetProxyPresentationDevice() {
-  return UsingD3D12Proxy() ? static_cast<IUnknown*>(proxy_device_12) : static_cast<IUnknown*>(proxy_device);
-}
 
 static bool IsProxyNativeDevice(const reshade::api::device* device) {
   if (device == nullptr) return false;
   const auto native_device = device->get_native();
   if (native_device == 0u) return false;
-  if (native_device == reinterpret_cast<uint64_t>(GetProxyPresentationDevice())) return true;
+  if (native_device == reinterpret_cast<uint64_t>(proxy_device)) return true;
 
   if (shared.data == nullptr) return false;
   return native_device == shared.data->proxy_native_device;
@@ -107,10 +80,6 @@ static bool IsProxyNativeDevice(const reshade::api::device* device) {
 inline bool IsCreatingProxyDevice() {
   return is_creating_proxy_device
          || (shared.data != nullptr && shared.data->is_creating_proxy_device);
-}
-
-inline bool IsCreatingBridgeDevice() {
-  return is_creating_bridge_device;
 }
 
 inline bool IsCreatingProxySwapchain() {
@@ -158,11 +127,6 @@ static std::unordered_map<uint64_t, std::unique_ptr<renodx::utils::draw::Swapcha
 
 struct ProxySharedResourcePair {
   reshade::api::resource host_shared_resource = {0u};
-  // D3D12 proxy only. The host writes the legacy-shared bridge resource, the
-  // bridge copies it into the NT-shared transport resource, and the proxy
-  // imports that transport resource as proxy_shared_resource.
-  reshade::api::resource bridge_shared_resource = {0u};
-  reshade::api::resource bridge_transport_resource = {0u};
   reshade::api::resource proxy_shared_resource = {0u};
 };
 struct ProxySharedResourceSource {
@@ -256,19 +220,6 @@ static void DestroyProxySharedResourcePair(ProxySharedResourcePair& pair) {
     pair.host_shared_resource = {0u};
   }
 
-  if (pair.bridge_transport_resource.handle != 0u) {
-    if (bridge_device_reshade != nullptr) {
-      bridge_device_reshade->destroy_resource(pair.bridge_transport_resource);
-    }
-    pair.bridge_transport_resource = {0u};
-  }
-  if (pair.bridge_shared_resource.handle != 0u) {
-    if (bridge_device_reshade != nullptr) {
-      bridge_device_reshade->destroy_resource(pair.bridge_shared_resource);
-    }
-    pair.bridge_shared_resource = {0u};
-  }
-
   if (pair.proxy_shared_resource.handle != 0u) {
     if (last_device_proxy_shared_resource.handle == pair.proxy_shared_resource.handle) {
       last_device_proxy_shared_resource = {0u};
@@ -295,8 +246,6 @@ static void DestroyProxySharedResourcesForHandle(uint64_t handle) {
        it_pair != proxy_shared_resources_by_clone.end(); ++it_pair) {
     const auto& pair = it_pair->second;
     if (pair.host_shared_resource.handle != handle
-        && pair.bridge_shared_resource.handle != handle
-        && pair.bridge_transport_resource.handle != handle
         && pair.proxy_shared_resource.handle != handle) {
       continue;
     }
@@ -313,53 +262,6 @@ static void OnDestroyTrackedResourceInfo(renodx::utils::resource::ResourceInfo* 
   if (info == nullptr) return;
   DestroyProxySharedResourcesForHandle(info->resource.handle);
   DestroyProxySharedResourcesForHandle(info->clone.handle);
-}
-
-static void DestroyTransportFence() {
-  if (transport_fence_bridge.handle != 0u) {
-    if (bridge_device_reshade != nullptr) {
-      bridge_device_reshade->destroy_fence(transport_fence_bridge);
-    }
-    transport_fence_bridge = {0u};
-  }
-  if (transport_fence_proxy.handle != 0u) {
-    if (proxy_device_reshade != nullptr) {
-      proxy_device_reshade->destroy_fence(transport_fence_proxy);
-    }
-    transport_fence_proxy = {0u};
-  }
-  transport_fence_value = 0u;
-}
-
-// Creates one shared NT fence on the D3D12 proxy and opens it on the D3D11
-// bridge. Returns false when either device cannot share NT fences.
-static bool EnsureTransportFence() {
-  if (transport_fence_proxy.handle != 0u && transport_fence_bridge.handle != 0u) return true;
-  if (proxy_device_reshade == nullptr || bridge_device_reshade == nullptr) return false;
-  if (!proxy_device_reshade->check_capability(reshade::api::device_caps::shared_fence_nt_handle)
-      || !bridge_device_reshade->check_capability(reshade::api::device_caps::shared_fence_nt_handle)) {
-    return false;
-  }
-
-  const auto flags = reshade::api::fence_flags::shared | reshade::api::fence_flags::shared_nt_handle;
-  void* handle = nullptr;
-  if (!proxy_device_reshade->create_fence(0u, flags, &transport_fence_proxy, &handle)
-      || transport_fence_proxy.handle == 0u || handle == nullptr) {
-    transport_fence_proxy = {0u};
-    return false;
-  }
-  const bool opened = bridge_device_reshade->create_fence(0u, flags, &transport_fence_bridge, &handle)
-                      && transport_fence_bridge.handle != 0u;
-  CloseHandle(handle);
-  if (!opened) {
-    transport_fence_bridge = {0u};
-    proxy_device_reshade->destroy_fence(transport_fence_proxy);
-    transport_fence_proxy = {0u};
-    return false;
-  }
-  transport_fence_value = 0u;
-  reshade::log::message(reshade::log::level::info, "utils::device_proxy::EnsureTransportFence(shared NT fence created)");
-  return true;
 }
 
 static void DestroyProxyDeviceResources(reshade::api::device* device) {
@@ -426,30 +328,17 @@ static void SetIntermediateFormat(reshade::api::format format) {
 }
 
 static void SetProxySettings(const renodx::utils::draw::SwapchainProxyPass& settings) {
-  // The first settings arrive while the proxy device is being created; only a
-  // later change needs the swapchain and passes rebuilt.
   local_proxy_settings_dirty = local_proxy_swapchain_settings_valid;
   local_proxy_swapchain_settings = settings;
   local_proxy_swapchain_settings_valid = true;
 }
 
-// The proxy present must never stall the host. A flip chain that DWM
-// composes (an overlay or another presenter on the window) retires frames
-// only per vblank and would otherwise block the game at a fraction of the
-// refresh rate. Drop the frame instead.
 static bool proxy_present_do_not_wait = true;
-// Sync interval of the proxy present, taken from the host swapchain request
-// so an in-game vsync setting still applies when the proxy owns presentation.
-// 0 presents immediately (tearing allowed), 1 or more waits for vblank.
 static std::atomic<uint32_t> proxy_sync_interval = 0u;
 
 static void SetProxySyncInterval(uint32_t sync_interval) {
   proxy_sync_interval = sync_interval;
 }
-// Frame-latency waitable object of the proxy swapchain. The proxy present and
-// all proxy-side GPU work are skipped while no back buffer is free, so a
-// composed flip chain never stalls the host thread (ReShade's D3D12 immediate
-// command list blocks on a fence once its allocator ring wraps).
 static HANDLE proxy_frame_latency_waitable = nullptr;
 static constexpr UINT PROXY_MAXIMUM_FRAME_LATENCY = 2u;
 
@@ -461,13 +350,6 @@ static void SetSameHwndNonFlipBootstrap(bool enabled) {
   }
 }
 
-
-// Host present suppression (D3D9 hosts). When the proxy flip chain lives on
-// the game window, the game's own D3D9 present must not reach that window:
-// DWM would compose two presenters and retire the flip chain once per vblank.
-// The native present is skipped at the vtable after ReShade's present event
-// has run, so the proxy shows the frame and DWM sees one flip-model owner.
-// A two-frame GPU throttle replaces the pacing the D3D9 present provided.
 static bool skip_host_present = false;
 static bool host_present_skip_pending = false;
 using D3D9PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
@@ -479,8 +361,6 @@ static D3D9SwapChainPresentFn real_d3d9_swapchain_present = nullptr;
 static vtable::Slot<D3D9PresentFn> d3d9_present_slot = {};
 static vtable::Slot<D3D9PresentExFn> d3d9_present_ex_slot = {};
 static vtable::Slot<D3D9SwapChainPresentFn> d3d9_swapchain_present_slot = {};
-// d3d9.h vtable layout: IDirect3DDevice9::Present, IDirect3DDevice9Ex::PresentEx,
-// IDirect3DSwapChain9::Present.
 static constexpr std::size_t D3D9_DEVICE_PRESENT_INDEX = 17u;
 static constexpr std::size_t D3D9_DEVICE_PRESENT_EX_INDEX = 121u;
 static constexpr std::size_t D3D9_SWAPCHAIN_PRESENT_INDEX = 3u;
@@ -597,7 +477,6 @@ static void ReleaseHostFrameQueries() {
   host_frame_query_index = 0u;
 }
 
-// Keeps at most HOST_FRAMES_IN_FLIGHT frames of D3D9 work queued on the GPU.
 static void ThrottleHostFrames(IDirect3DDevice9* native) {
   auto*& query = host_frame_queries[host_frame_query_index];
   if (query == nullptr && FAILED(native->CreateQuery(D3DQUERYTYPE_EVENT, &query))) {
@@ -622,12 +501,12 @@ static void DestroyProxySwapchainPasses(reshade::api::device* device) {
   proxy_swapchain_passes.clear();
 }
 
-static IUnknown* GetDeviceProxy(const reshade::api::resource_desc& host_resource_desc, HWND hwnd = nullptr) {
+static ID3D11Device* GetDeviceProxy(const reshade::api::resource_desc& host_resource_desc, HWND hwnd = nullptr) {
   if (!shared.IsEventHandler()) return nullptr;
   if (shared.data == nullptr) return nullptr;
   if (device_proxy_creation_failed) return nullptr;
-  if (GetProxyPresentationDevice() != nullptr && proxy_swap_chain != nullptr) {
-    return GetProxyPresentationDevice();
+  if (proxy_device != nullptr && proxy_swap_chain != nullptr) {
+    return proxy_device;
   }
   if (!renodx::utils::directx::Initialize()) return nullptr;
 
@@ -675,27 +554,17 @@ static IUnknown* GetDeviceProxy(const reshade::api::resource_desc& host_resource
   sc_desc.Scaling = DXGI_SCALING_STRETCH;
   fullscreen_desc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
 
-  const bool use_d3d12 = UsingD3D12Proxy();
-
   if (proxy_device == nullptr) {
-    // D3D11 device: the presentation device, or the transport bridge for D3D12.
     UINT create_flags = D3D11_CREATE_DEVICE_SINGLETHREADED;
     D3D_FEATURE_LEVEL feature_level;
 
     assert(is_creating_proxy_device == false);
-    assert(is_creating_bridge_device == false);
-    if (use_d3d12) {
-      assert(bridge_device_reshade == nullptr);
-      is_creating_bridge_device = true;
-    } else {
-      assert(proxy_device_reshade == nullptr);
-      is_creating_proxy_device = true;
-      if (shared.data != nullptr) shared.data->is_creating_proxy_device = true;
-    }
+    assert(proxy_device_reshade == nullptr);
+    is_creating_proxy_device = true;
+    if (shared.data != nullptr) shared.data->is_creating_proxy_device = true;
     const HRESULT create_device_hr = renodx::utils::directx::pD3D11CreateDevice(
         nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, create_flags,
         nullptr, 0, D3D11_SDK_VERSION, &proxy_device, &feature_level, &proxy_device_context);
-    is_creating_bridge_device = false;
     is_creating_proxy_device = false;
     if (shared.data != nullptr) shared.data->is_creating_proxy_device = false;
     if (FAILED(create_device_hr)) {
@@ -703,10 +572,7 @@ static IUnknown* GetDeviceProxy(const reshade::api::resource_desc& host_resource
       proxy_device_context = nullptr;
       return nullptr;
     }
-    if (!use_d3d12) {
-      bridge_device_reshade = proxy_device_reshade;
-    }
-    if ((use_d3d12 ? bridge_device_reshade : proxy_device_reshade) == nullptr) {
+    if (proxy_device_reshade == nullptr) {
       reshade::log::message(reshade::log::level::error, "utils::device_proxy::GetDeviceProxy(D3D11CreateDevice succeeded but Reshade device is null)");
       // Reshade is not hooked to DX11
       if (proxy_device_context != nullptr) {
@@ -724,58 +590,10 @@ static IUnknown* GetDeviceProxy(const reshade::api::resource_desc& host_resource
     proxy_device->GetImmediateContext(&proxy_device_context);
   }
 
-  if (use_d3d12 && proxy_device_12 == nullptr) {
-    assert(is_creating_proxy_device == false);
-    assert(proxy_device_reshade == nullptr);
-    is_creating_proxy_device = true;
-    if (shared.data != nullptr) shared.data->is_creating_proxy_device = true;
-    const HRESULT create_device_hr = renodx::utils::directx::pD3D12CreateDevice(
-        nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&proxy_device_12));
-    is_creating_proxy_device = false;
-    if (shared.data != nullptr) shared.data->is_creating_proxy_device = false;
-    if (FAILED(create_device_hr)) {
-      std::stringstream s;
-      s << "utils::device_proxy::GetDeviceProxy(D3D12CreateDevice failed: hr=0x";
-      s << std::hex << static_cast<uint32_t>(create_device_hr) << std::dec << ")";
-      reshade::log::message(reshade::log::level::error, s.str().c_str());
-      proxy_device_12 = nullptr;
-      device_proxy_creation_failed = true;
-      return nullptr;
-    }
-    if (proxy_device_reshade == nullptr) {
-      reshade::log::message(reshade::log::level::error, "utils::device_proxy::GetDeviceProxy(D3D12CreateDevice succeeded but Reshade device is null)");
-      // Reshade is not hooked to DX12
-      proxy_device_12->Release();
-      proxy_device_12 = nullptr;
-      device_proxy_creation_failed = true;
-      return nullptr;
-    }
-  }
-  if (use_d3d12 && proxy_command_queue == nullptr) {
-    // A D3D12 DXGI swapchain is created from a direct command queue.
-    D3D12_COMMAND_QUEUE_DESC queue_desc = {};
-    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-    queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-    queue_desc.NodeMask = 0;
-    const HRESULT create_queue_hr = proxy_device_12->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&proxy_command_queue));
-    if (FAILED(create_queue_hr)) {
-      std::stringstream s;
-      s << "utils::device_proxy::GetDeviceProxy(CreateCommandQueue failed: hr=0x";
-      s << std::hex << static_cast<uint32_t>(create_queue_hr) << std::dec << ")";
-      reshade::log::message(reshade::log::level::error, s.str().c_str());
-      proxy_command_queue = nullptr;
-      device_proxy_creation_failed = true;
-      return nullptr;
-    }
-  }
-
-  IUnknown* swapchain_creator = use_d3d12
-                                    ? static_cast<IUnknown*>(proxy_command_queue)
-                                    : static_cast<IUnknown*>(proxy_device);
+  IUnknown* swapchain_creator = proxy_device;
 
   if (proxy_swap_chain != nullptr) {
-    return GetProxyPresentationDevice();
+    return proxy_device;
   }
 
   IDXGIFactory2* dxgi_factory = nullptr;
@@ -978,11 +796,11 @@ static IUnknown* GetDeviceProxy(const reshade::api::resource_desc& host_resource
     swap_chain_3->Release();
   }
 
-  return GetProxyPresentationDevice();
+  return proxy_device;
 }
 
 [[deprecated("Use GetDeviceProxy(resource_desc) instead")]]
-static IUnknown* GetDeviceProxy(renodx::utils::resource::ResourceInfo* host_resource_info, HWND hwnd = nullptr) {
+static ID3D11Device* GetDeviceProxy(renodx::utils::resource::ResourceInfo* host_resource_info, HWND hwnd = nullptr) {
   if (host_resource_info == nullptr) return nullptr;
   return GetDeviceProxy(host_resource_info->desc, hwnd);
 }
@@ -1083,71 +901,6 @@ static IUnknown* GetDeviceProxy(renodx::utils::resource::ResourceInfo* host_reso
 
 // clang-format on
 
-// D3D12 proxy transport: the D3D11 bridge creates an NT-handle allocation and
-// the D3D12 proxy imports it. The exported handle is closed after import.
-static bool CreateProxyTransportResources(
-    reshade::api::resource_desc desc,
-    reshade::api::resource_usage initial_state,
-    ProxySharedResourcePair* pair) {
-  if (bridge_device_reshade == nullptr || proxy_device_reshade == nullptr || pair == nullptr) return false;
-
-  desc.flags = reshade::api::resource_flags::shared | reshade::api::resource_flags::shared_nt_handle;
-  desc.usage = reshade::api::resource_usage::copy_source
-               | reshade::api::resource_usage::copy_dest
-               | reshade::api::resource_usage::shader_resource;
-
-  reshade::api::resource transport = {0u};
-  void* handle = nullptr;
-  if (!bridge_device_reshade->create_resource(desc, nullptr, initial_state, &transport, &handle)
-      || transport.handle == 0u || handle == nullptr) {
-    std::stringstream s;
-    s << "utils::device_proxy::CreateProxyTransportResources(create NT transport resource failed: ";
-    s << "format=" << desc.texture.format;
-    s << ", size=" << desc.texture.width << "x" << desc.texture.height;
-    s << ")";
-    reshade::log::message(reshade::log::level::error, s.str().c_str());
-    if (transport.handle != 0u) bridge_device_reshade->destroy_resource(transport);
-    return false;
-  }
-
-  reshade::api::resource imported = {0u};
-  void* import_handle = handle;
-  const bool imported_ok = proxy_device_reshade->create_resource(
-                               desc, nullptr, reshade::api::resource_usage::general, &imported, &import_handle)
-                           && imported.handle != 0u;
-  CloseHandle(handle);
-  if (!imported_ok) {
-    reshade::log::message(reshade::log::level::error, "utils::device_proxy::CreateProxyTransportResources(D3D12 OpenSharedHandle failed)");
-    bridge_device_reshade->destroy_resource(transport);
-    return false;
-  }
-
-  renodx::utils::resource::UpsertResourceInfo(transport, [&](renodx::utils::resource::ResourceInfo* info, const bool inserted) {
-    (void)inserted;
-    *info = {
-        .device = bridge_device_reshade,
-        .desc = desc,
-        .resource = transport,
-        .destroyed = false,
-        .initial_state = initial_state,
-    };
-  });
-  renodx::utils::resource::UpsertResourceInfo(imported, [&](renodx::utils::resource::ResourceInfo* info, const bool inserted) {
-    (void)inserted;
-    *info = {
-        .device = proxy_device_reshade,
-        .desc = desc,
-        .resource = imported,
-        .destroyed = false,
-        .initial_state = reshade::api::resource_usage::general,
-    };
-  });
-
-  pair->bridge_transport_resource = transport;
-  pair->proxy_shared_resource = imported;
-  return true;
-}
-
 static ProxySharedResourcePair GetProxySharedResourcePair(
     const ProxySharedResourceSource& source_resource_info,
     const reshade::api::resource& source_clone,
@@ -1173,7 +926,7 @@ static ProxySharedResourcePair GetProxySharedResourcePair(
     proxy_source_desc = source_resource_info.desc;
   }
 
-  if (GetDeviceProxy(proxy_source_desc, hwnd) == nullptr || proxy_device_reshade == nullptr || bridge_device_reshade == nullptr) {
+  if (GetDeviceProxy(proxy_source_desc, hwnd) == nullptr || proxy_device_reshade == nullptr) {
     assert(false && "GetProxySharedResourcePair called but proxy device is not available");
     return {};
   }
@@ -1200,12 +953,10 @@ static ProxySharedResourcePair GetProxySharedResourcePair(
     new_desc.flags |= reshade::api::resource_flags::shared_nt_handle;
   }
 
-  // The D3D9/D3D11 host opens a legacy shared handle, so the shared resource
-  // is created on the D3D11 device: the proxy itself, or the bridge for D3D12.
   reshade::api::resource new_proxy_resource = {0u};
   reshade::api::resource new_host_shared_resource = {0u};
   void* new_shared_handle = nullptr;
-  if (!bridge_device_reshade->create_resource(
+  if (!proxy_device_reshade->create_resource(
           new_desc,
           nullptr,
           source_resource_info.initial_state,
@@ -1225,7 +976,7 @@ static ProxySharedResourcePair GetProxySharedResourcePair(
   }
   if (new_proxy_resource.handle == 0u || new_shared_handle == nullptr) {
     if (new_proxy_resource.handle != 0u) {
-      bridge_device_reshade->destroy_resource(new_proxy_resource);
+      proxy_device_reshade->destroy_resource(new_proxy_resource);
     }
     reshade::log::message(
         reshade::log::level::error,
@@ -1240,7 +991,7 @@ static ProxySharedResourcePair GetProxySharedResourcePair(
           source_resource_info.initial_state,
           &new_host_shared_resource,
           &host_shared_handle)) {
-    bridge_device_reshade->destroy_resource(new_proxy_resource);
+    proxy_device_reshade->destroy_resource(new_proxy_resource);
     std::stringstream s;
     s << "utils::device_proxy::GetProxySharedResourcePair(create host shared resource failed: ";
     s << "resource=" << PRINT_PTR(source_clone.handle);
@@ -1254,7 +1005,7 @@ static ProxySharedResourcePair GetProxySharedResourcePair(
     return {};
   }
   if (new_host_shared_resource.handle == 0u) {
-    bridge_device_reshade->destroy_resource(new_proxy_resource);
+    proxy_device_reshade->destroy_resource(new_proxy_resource);
     reshade::log::message(
         reshade::log::level::error,
         "utils::device_proxy::GetProxySharedResourcePair(create host shared resource returned invalid resource)");
@@ -1264,7 +1015,7 @@ static ProxySharedResourcePair GetProxySharedResourcePair(
   renodx::utils::resource::UpsertResourceInfo(new_proxy_resource, [&](renodx::utils::resource::ResourceInfo* info, const bool inserted) {
     (void)inserted;
     *info = {
-        .device = bridge_device_reshade,
+        .device = proxy_device_reshade,
         .desc = new_desc,
         .resource = new_proxy_resource,
         .destroyed = false,
@@ -1285,54 +1036,16 @@ static ProxySharedResourcePair GetProxySharedResourcePair(
 
   ProxySharedResourcePair pair = {
       .host_shared_resource = new_host_shared_resource,
+      .proxy_shared_resource = new_proxy_resource,
   };
-  if (UsingD3D12Proxy()) {
-    pair.bridge_shared_resource = new_proxy_resource;
-    if (!CreateProxyTransportResources(new_desc, source_resource_info.initial_state, &pair)) {
-      DestroyProxySharedResourcePair(pair);
-      return {};
-    }
-  } else {
-    pair.proxy_shared_resource = new_proxy_resource;
-  }
   proxy_shared_resources_by_clone[source_clone.handle] = pair;
 
   return pair;
 }
 
-// Copies the bridge resource into the NT transport resource and signals the
-// D3D12 proxy. Returns false when the bridge queue is unavailable.
-static bool TransportThroughBridge(const ProxySharedResourcePair& pair) {
-  if (bridge_queue_reshade == nullptr
-      || pair.bridge_shared_resource.handle == 0u
-      || pair.bridge_transport_resource.handle == 0u) {
-    reshade::log::message(reshade::log::level::error, "utils::device_proxy::TransportThroughBridge(bridge queue or resources unavailable)");
-    return false;
-  }
-  bridge_queue_reshade->get_immediate_command_list()->copy_resource(pair.bridge_shared_resource, pair.bridge_transport_resource);
-  bridge_queue_reshade->flush_immediate_command_list();
-
-  if (EnsureTransportFence()) {
-    const uint64_t value = transport_fence_value + 1u;
-    if (bridge_queue_reshade->signal(transport_fence_bridge, value)) {
-      bridge_queue_reshade->flush_immediate_command_list();
-      transport_fence_value = value;
-      return true;
-    }
-  }
-  if (!transport_fence_unavailable_logged) {
-    transport_fence_unavailable_logged = true;
-    reshade::log::message(reshade::log::level::warning, "utils::device_proxy::TransportThroughBridge(shared fence unavailable, using bridge wait idle)");
-  }
-  // Conservative boundary: bridge work completes before the proxy reads.
-  bridge_queue_reshade->wait_idle();
-  return true;
-}
-
 // Old DrawSwapChainProxy
 static void OnPresentForProxyDevice(reshade::api::device* device, reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) {
   auto* cmd_list = queue->get_immediate_command_list();
-  const bool use_explicit_barriers = device->get_api() == reshade::api::device_api::d3d12;
   if (!local_proxy_swapchain_settings_valid) {
     return;
   }
@@ -1423,39 +1136,7 @@ static void OnPresentForProxyDevice(reshade::api::device* device, reshade::api::
         };
       });
     }
-    if (use_explicit_barriers) {
-      if (transport_fence_proxy.handle != 0u && transport_fence_value != 0u) {
-        // GPU-side wait for the bridge copy before reading the imported resource.
-        queue->wait(transport_fence_proxy, transport_fence_value);
-      }
-      static constexpr std::array PRE_COPY_OLD_STATES = {
-          reshade::api::resource_usage::general,
-          reshade::api::resource_usage::general};
-      static constexpr std::array PRE_COPY_NEW_STATES = {
-          reshade::api::resource_usage::copy_source,
-          reshade::api::resource_usage::copy_dest};
-      const std::array pre_copy_resources = {proxy_temp_resource, proxy_device_resource};
-      cmd_list->barrier(
-          static_cast<uint32_t>(pre_copy_resources.size()),
-          pre_copy_resources.data(),
-          PRE_COPY_OLD_STATES.data(),
-          PRE_COPY_NEW_STATES.data());
-    }
     cmd_list->copy_resource(proxy_temp_resource, proxy_device_resource);
-    if (use_explicit_barriers) {
-      static constexpr std::array POST_COPY_OLD_STATES = {
-          reshade::api::resource_usage::copy_source,
-          reshade::api::resource_usage::copy_dest};
-      static constexpr std::array POST_COPY_NEW_STATES = {
-          reshade::api::resource_usage::general,
-          reshade::api::resource_usage::shader_resource};
-      const std::array post_copy_resources = {proxy_temp_resource, proxy_device_resource};
-      cmd_list->barrier(
-          static_cast<uint32_t>(post_copy_resources.size()),
-          post_copy_resources.data(),
-          POST_COPY_OLD_STATES.data(),
-          POST_COPY_NEW_STATES.data());
-    }
     queue->flush_immediate_command_list();
     if (device_proxy_wait_idle_destination) {
       queue->wait_idle();
@@ -1482,58 +1163,18 @@ static void OnPresentForProxyDevice(reshade::api::device* device, reshade::api::
     };
     pass_data.reset(pass);
   }
-  if (use_explicit_barriers) {
-    // The override path skips the compatibility-mode copy that would otherwise
-    // move the back buffer into the render target state.
-    static constexpr std::array PRE_RENDER_OLD_STATES = {reshade::api::resource_usage::present};
-    static constexpr std::array PRE_RENDER_NEW_STATES = {reshade::api::resource_usage::render_target};
-    const std::array pre_render_resources = {back_buffer};
-    cmd_list->barrier(
-        static_cast<uint32_t>(pre_render_resources.size()),
-        pre_render_resources.data(),
-        PRE_RENDER_OLD_STATES.data(),
-        PRE_RENDER_NEW_STATES.data());
-  }
   if (!pass_data->Render(swapchain, queue, &proxy_device_resource)) {
     pass_data->pass.DestroyAll(device);
     proxy_swapchain_passes.erase(back_buffer_handle);
-  } else if (use_explicit_barriers) {
-    static constexpr std::array POST_RENDER_OLD_STATES = {reshade::api::resource_usage::shader_resource};
-    static constexpr std::array POST_RENDER_NEW_STATES = {reshade::api::resource_usage::general};
-    const std::array post_render_resources = {proxy_device_resource};
-    cmd_list->barrier(
-        static_cast<uint32_t>(post_render_resources.size()),
-        post_render_resources.data(),
-        POST_RENDER_OLD_STATES.data(),
-        POST_RENDER_NEW_STATES.data());
   }
 }
 
 static void OnInitDevice(reshade::api::device* device) {
-  if (IsCreatingBridgeDevice()) {
-    bridge_device_reshade = device;
-    return;
-  }
   if (!IsCreatingProxyDevice() && !IsProxyNativeDevice(device)) return;
   proxy_device_reshade = device;
   if (shared.data != nullptr) {
     shared.data->proxy_reshade_device = device;
-    shared.data->proxy_native_device = reinterpret_cast<uintptr_t>(GetProxyPresentationDevice());
-  }
-}
-
-static void OnInitCommandQueue(reshade::api::command_queue* queue) {
-  if (queue == nullptr) return;
-  if (!IsCreatingBridgeDevice()
-      && (bridge_device_reshade == nullptr || queue->get_device() != bridge_device_reshade)) {
-    return;
-  }
-  bridge_queue_reshade = queue;
-}
-
-static void OnDestroyCommandQueue(reshade::api::command_queue* queue) {
-  if (queue != nullptr && queue == bridge_queue_reshade) {
-    bridge_queue_reshade = nullptr;
+    shared.data->proxy_native_device = reinterpret_cast<uintptr_t>(proxy_device);
   }
 }
 
@@ -1549,15 +1190,6 @@ static void OnDestroyDevice(reshade::api::device* device) {
     if (proxy_swap_chain != nullptr) {
       proxy_swap_chain->Release();
       proxy_swap_chain = nullptr;
-    }
-    DestroyTransportFence();
-    if (proxy_command_queue != nullptr) {
-      proxy_command_queue->Release();
-      proxy_command_queue = nullptr;
-    }
-    if (proxy_device_12 != nullptr) {
-      proxy_device_12->Release();
-      proxy_device_12 = nullptr;
     }
     if (proxy_device_context != nullptr) {
       proxy_device_context->Release();
@@ -1575,25 +1207,13 @@ static void OnDestroyDevice(reshade::api::device* device) {
   } else if (device == proxy_device_reshade) {
     DestroyProxyDeviceResources(device);
     DestroyProxySwapchainPasses(device);
-    DestroyTransportFence();
     last_device_proxy_shared_resource = {0u};
     proxy_device_reshade = nullptr;
-    if (bridge_device_reshade == device) {
-      bridge_device_reshade = nullptr;
-      bridge_queue_reshade = nullptr;
-    }
     if (shared.data != nullptr && device == shared.data->proxy_reshade_device) {
       shared.data->proxy_reshade_device = nullptr;
       shared.data->proxy_native_device = 0u;
     }
     reshade::log::message(reshade::log::level::info, "utils::device_proxy::OnDestroyDevice(Proxy device destroyed.)");
-  } else if (device == bridge_device_reshade) {
-    DestroyProxyDeviceResources(proxy_device_reshade);
-    DestroyTransportFence();
-    last_device_proxy_shared_resource = {0u};
-    bridge_device_reshade = nullptr;
-    bridge_queue_reshade = nullptr;
-    reshade::log::message(reshade::log::level::info, "utils::device_proxy::OnDestroyDevice(Bridge device destroyed.)");
   }
 }
 
@@ -2296,27 +1916,17 @@ static void OnPresent(
     ThrottleHostFrames(reinterpret_cast<IDirect3DDevice9*>(device->get_native()));
   }
 
-  if (UsingD3D12Proxy() && !TransportThroughBridge(shared_pair)) {
-    SetProxyRemovePending(true);
-    return;
-  }
-
   // Publish the shared resource handoff for proxy consumption.
   last_device_proxy_shared_resource = shared_pair.proxy_shared_resource;
 
-  // The proxy owns presentation from here on; the host present that follows
-  // this callback is skipped. Earlier returns leave the host present visible.
   host_present_skip_pending = HostPresentHooksInstalled();
 
   if (proxy_frame_latency_waitable != nullptr
       && WaitForSingleObject(proxy_frame_latency_waitable, 0) != WAIT_OBJECT_0) {
-    // No free back buffer: skip this frame instead of queueing GPU work that
-    // would wait for the compositor and eventually block the host thread.
     return;
   }
 
   const UINT sync_interval = proxy_sync_interval.load();
-  // DXGI_PRESENT_ALLOW_TEARING is only valid with sync interval 0.
   UINT present_flags =
       (proxy_swap_chain == nullptr || sync_interval != 0u) ? 0u : proxy_present_flags.load();
   if (proxy_swap_chain != nullptr
@@ -2349,14 +1959,12 @@ static void OnPresent(
     proxy_present_test_pending.store(false);
   }
 
-  // A vsync present blocks on purpose: that is what paces the game.
   const bool non_blocking_present = sync_interval == 0u && proxy_present_do_not_wait;
   if (non_blocking_present) {
     present_flags |= DXGI_PRESENT_DO_NOT_WAIT;
   }
   const HRESULT present_hr = proxy_swap_chain->Present(sync_interval, present_flags);
   if (non_blocking_present && present_hr == DXGI_ERROR_WAS_STILL_DRAWING) {
-    // The present queue is full. Frame dropped on purpose instead of stalling.
     proxy_invalid_call_streak.store(0);
     return;
   }
@@ -2415,8 +2023,6 @@ static void Use(DWORD fdw_reason) {
 
       shared.RegisterEvent<reshade::addon_event::init_device>(OnInitDevice);
       shared.RegisterEvent<reshade::addon_event::destroy_device>(OnDestroyDevice);
-      shared.RegisterEvent<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
-      shared.RegisterEvent<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
       shared.RegisterEvent<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       shared.RegisterEvent<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       shared.RegisterEvent<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
@@ -2430,8 +2036,6 @@ static void Use(DWORD fdw_reason) {
 
       shared.UnregisterEvent<reshade::addon_event::init_device>(OnInitDevice);
       shared.UnregisterEvent<reshade::addon_event::destroy_device>(OnDestroyDevice);
-      shared.UnregisterEvent<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
-      shared.UnregisterEvent<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
       shared.UnregisterEvent<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       shared.UnregisterEvent<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       shared.UnregisterEvent<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
