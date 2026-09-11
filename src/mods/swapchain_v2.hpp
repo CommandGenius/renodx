@@ -685,9 +685,11 @@ static bool OnCreateSwapchain(reshade::api::swapchain_desc& desc, void* hwnd) {
   } else if (device_api == reshade::api::device_api::opengl) {
     // Nothing for now
   }
-  if (utils::device_proxy::UseProxyRequested()) {
-    // The proxy is the visible presenter; carry the requested vsync over to
-    // it. D3D9 treats the default interval as one vblank.
+  if (utils::device_proxy::UseProxyRequested() && !utils::device_proxy::IsCreatingProxySwapchain()) {
+    // The proxy is the visible presenter; carry the host's requested vsync
+    // over to it. The proxy's own chain also passes through here and must
+    // not feed its DXGI default back. D3D9 treats the default interval as
+    // one vblank.
     const uint32_t requested_sync_interval =
         (desc.sync_interval == UINT32_MAX) ? 1u : desc.sync_interval;
     utils::device_proxy::SetProxySyncInterval(requested_sync_interval);
