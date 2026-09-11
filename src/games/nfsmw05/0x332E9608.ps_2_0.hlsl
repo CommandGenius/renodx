@@ -24,10 +24,16 @@ struct PS_OUT {
 };
 
 PS_OUT main(float2 uv : TEXCOORD0) {
+  // RenoDX: the scene target is float now and can hold inf and NaN from
+  // overflowed spark blending. A NaN tap here poisons the luminance measure,
+  // and with it eye adaptation, permanently. min() passes NaN through on some
+  // GPUs; saturate() lowers to the NaN-suppressing clamp and matches what the
+  // original 8-bit source delivered here anyway. One saturate per tap fits the
+  // 64 arithmetic slots ps_2_0 allows.
   float4 sum = 0.f;
   [unroll]
   for (int i = 0; i < 16; ++i) {
-    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + g_avSampleOffsets[i].xy);
+    sum += saturate(tex2D(DIFFUSEMAP_SAMPLER, uv + g_avSampleOffsets[i].xy));
   }
 
   float4 r1;

@@ -19,6 +19,12 @@ sampler2D DIFFUSEMAP_SAMPLER : register(s0);
 float4 main(float2 uv : TEXCOORD0) : COLOR0 {
   float4 r0 = tex2D(DIFFUSEMAP_SAMPLER, uv);                 // texld r0, t0, s0
 
+  // RenoDX: bound the tap on read. The float scene target can hold inf and
+  // NaN from overflowed spark blending; min() passes NaN through on some GPUs,
+  // while saturate() lowers to the NaN-suppressing clamp and matches what the
+  // original 8-bit source delivered here anyway.
+  r0.rgb = saturate(r0.rgb);
+
   float scale = g_fMiddleGray / (g_fAdaptedLum + 0.001f);    // add / rcp / mul
   r0.rgb = max(r0.rgb * scale - g_fBrightPassThreshold, 0.f); // mad / max
 

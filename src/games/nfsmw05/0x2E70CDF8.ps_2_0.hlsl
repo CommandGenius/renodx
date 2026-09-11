@@ -17,10 +17,16 @@ float4 g_avSampleWeights[13] : register(c13);
 sampler2D DIFFUSEMAP_SAMPLER : register(s0);
 
 float4 main(float2 uv : TEXCOORD0) : COLOR0 {
+  // RenoDX: bound every tap on read so an inf or NaN pixel from an overflowed
+  // float source cannot spread through the kernel. min() passes NaN through on
+  // some GPUs; saturate() lowers to the NaN-suppressing clamp and matches what
+  // the original 8-bit source delivered here anyway.
   float4 sum = 0.f;
   [unroll]
   for (int i = 0; i < 13; ++i) {
-    sum += g_avSampleWeights[i] * tex2D(DIFFUSEMAP_SAMPLER, uv + g_avSampleOffsets[i].xy);
+    float4 t = tex2D(DIFFUSEMAP_SAMPLER, uv + g_avSampleOffsets[i].xy);
+    t.rgb = saturate(t.rgb);
+    sum += g_avSampleWeights[i] * t;
   }
   return sum;  // mov oC0, r0
 }

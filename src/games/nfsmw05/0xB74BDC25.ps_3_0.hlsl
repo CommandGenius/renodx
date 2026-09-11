@@ -87,7 +87,15 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0 {
   const float correction = RENODX_GAMMA_CORRECTION;
   const float scaling = RENODX_DIFFUSE_WHITE_NITS / RENODX_GRAPHICS_WHITE_NITS;
 
-  float3 encoded = max(c.rgb, 0.f);
+  // Bound the input without min/max: those lower to SPIR-V ops that are
+  // undefined for NaN and pass it through on some GPUs. A comparison is false
+  // for NaN, so a select on one always lands on the finite fallback. The bound
+  // and the fallback differ slightly so fxc cannot fold the select back into
+  // min/max. 64.0 in the intermediate encoding is far beyond any headroom the
+  // visual treatment can produce.
+  float3 encoded = c.rgb;
+  encoded = (encoded > -1e-4f) ? encoded : 0.f;
+  encoded = (encoded < 64.f) ? encoded : 63.99f;
   float3 decoded =
       (encoding == 1.f) ? renodx::color::srgb::Decode(encoded)
       : (encoding == 2.f) ? renodx::color::gamma::Decode(encoded, 2.2f)

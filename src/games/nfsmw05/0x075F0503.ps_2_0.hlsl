@@ -15,10 +15,14 @@ float4 g_avSampleOffsets[9] : register(c0);
 sampler2D DIFFUSEMAP_SAMPLER : register(s0);
 
 float4 main(float2 uv : TEXCOORD0) : COLOR0 {
+  // RenoDX: bound every tap on read. The luminance carried in alpha can be inf
+  // or NaN once a float scene target overflows, and either poisons eye
+  // adaptation permanently. min() passes NaN through on some GPUs; saturate()
+  // lowers to the NaN-suppressing clamp and matches the original 8-bit source.
   float sum = 0.f;
   [unroll]
   for (int i = 0; i < 9; ++i) {
-    sum += tex2D(DIFFUSEMAP_SAMPLER, uv + g_avSampleOffsets[i].xy).a;
+    sum += saturate(tex2D(DIFFUSEMAP_SAMPLER, uv + g_avSampleOffsets[i].xy).a);
   }
 
   float4 o;
