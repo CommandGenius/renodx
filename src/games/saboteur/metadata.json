@@ -1,0 +1,24 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "saboteur",
+  "title": "The Saboteur",
+  "status": "experimental",
+  "summary": "Adds HDR support by upgrading the scene render targets and replacing the final hard-clip composite with a tone mapper.",
+  "tags": [
+    "graphics",
+    "hdr",
+    "tone-mapping"
+  ],
+  "notes": [
+    "Load ReShade as d3d9.dll with DXVK (dxgi_dxvk.dll) so the D3D11/D3D12 swapchain proxy can present HDR.",
+    "Use borderless/windowed mode for HDR output."
+  ],
+  "deploy": {
+    "game_exe": "Saboteur.exe",
+    "process_name": "Saboteur",
+    "api": "d3d9",
+    "architecture": [
+      "x86"
+    ]
+  }
+}
