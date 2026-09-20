@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Carlos Lopez
+ * SPDX-License-Identifier: MIT
+ */
+
 #define ImTextureID ImU64
 
 #define DEBUG_LEVEL_0
@@ -2204,6 +2209,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       if (!reshade::register_addon(h_module)) return FALSE;
 
       if (!initialized) {
+        // while (!IsDebuggerPresent()) Sleep(100);
+
         renodx::mods::shader::force_pipeline_cloning = true;
         renodx::mods::shader::expected_constant_buffer_space = 50;
         renodx::mods::shader::expected_constant_buffer_index = 13;
@@ -2212,6 +2219,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
         renodx::mods::swapchain::expected_constant_buffer_index = 13;
         renodx::mods::swapchain::expected_constant_buffer_space = 50;
+        // renodx::mods::swapchain::target_format = reshade::api::format::b8g8r8a8_unorm;
+        // renodx::mods::swapchain::target_color_space = reshade::api::color_space::srgb_nonlinear;
         renodx::mods::swapchain::use_resource_cloning = true;
         renodx::mods::swapchain::set_color_space = false;
         renodx::mods::swapchain::use_device_proxy = true;
@@ -2290,6 +2299,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
               .on_change_value = [](float previous, float current) {
                 bool is_hdr10 = current == 4;
                 shader_injection.swap_chain_encoding_color_space = (is_hdr10 ? 1.f : 0.f);
+                // return void
               },
               .is_global = true,
               .is_visible = []() { return current_settings_mode >= 2; },
@@ -2298,40 +2308,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           bool is_hdr10 = setting->GetValue() == 4;
           renodx::mods::swapchain::SetUseHDR10(is_hdr10);
           shader_injection.swap_chain_encoding_color_space = is_hdr10 ? 1.f : 0.f;
-          settings.push_back(setting);
-        }
-
-        {
-          auto* setting = new renodx::utils::settings::Setting{
-              .key = "SwapChainDeviceProxyBaseWaitIdle",
-              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-              .default_value = 0.f,
-              .label = "Base Wait Idle",
-              .section = "Display Proxy",
-              .tooltip = "Waits for the D3D9 device before the proxy reads the shared frame",
-              .labels = {"Off", "On"},
-              .is_global = true,
-              .is_visible = []() { return current_settings_mode >= 2; },
-          };
-          renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
-          renodx::mods::swapchain::device_proxy_wait_idle_source = (setting->GetValue() == 1.f);
-          settings.push_back(setting);
-        }
-
-        {
-          auto* setting = new renodx::utils::settings::Setting{
-              .key = "SwapChainDeviceProxyProxyWaitIdle",
-              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-              .default_value = 0.f,
-              .label = "Proxy Wait Idle",
-              .section = "Display Proxy",
-              .tooltip = "Waits for the proxy device after it consumes the shared frame",
-              .labels = {"Off", "On"},
-              .is_global = true,
-              .is_visible = []() { return current_settings_mode >= 2; },
-          };
-          renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
-          renodx::mods::swapchain::device_proxy_wait_idle_destination = (setting->GetValue() == 1.f);
           settings.push_back(setting);
         }
 
