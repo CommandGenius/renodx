@@ -416,6 +416,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         renodx::mods::swapchain::set_color_space = false;
         renodx::mods::swapchain::use_device_proxy = true;
         renodx::mods::swapchain::proxy_skip_host_present = true;
+        renodx::mods::swapchain::device_proxy_wait_idle_source = true;
         renodx::mods::swapchain::swap_chain_proxy_shaders = {
             {
                 reshade::api::device_api::d3d11,
