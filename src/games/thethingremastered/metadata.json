@@ -1,0 +1,27 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "thethingremastered",
+  "title": "The Thing: Remastered",
+  "variant": "Vulkan",
+  "status": "experimental",
+  "summary": "Adds HDR support by upgrading the scene render targets, bridging the SDR color grade LUT, and replacing the final hard-clip post pass with a tone mapper.",
+  "tags": [
+    "graphics",
+    "hdr",
+    "tone-mapping",
+    "vulkan"
+  ],
+  "notes": [
+    "Requires the Vulkan renderer.",
+    "Use borderless/windowed mode for HDR output."
+  ],
+  "deploy": {
+    "api": "vulkan",
+    "architecture": [
+      "x64"
+    ],
+    "game_exe": "amun_Shipping_Steam_x64.exe",
+    "process_name": "amun_Shipping_Steam_x64",
+    "platform": "steam"
+  }
+}
