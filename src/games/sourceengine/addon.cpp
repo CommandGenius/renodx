@@ -137,31 +137,56 @@ void DrawFullscreen(IDirect3DDevice9* device, IDirect3DPixelShader9* shader, std
   state->Release();
 }
 
-bool OnVanillaHistogramDraw(reshade::api::command_list* cmd_list) {
-  auto* device = GetNativeDevice(cmd_list);
+IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   IDirect3DBaseTexture9* texture = nullptr;
   device->GetTexture(0, &texture);
-  if (texture == nullptr) return true;
   if (scene_copy_texture != nullptr) scene_copy_texture->Release();
   scene_copy_texture = texture;
   histogram_drawn = true;
-  if (texture->GetType() != D3DRTYPE_TEXTURE) return true;
+  if (texture == nullptr || texture->GetType() != D3DRTYPE_TEXTURE) return nullptr;
   auto* copy = static_cast<IDirect3DTexture9*>(texture);
   D3DSURFACE_DESC desc = {};
   copy->GetLevelDesc(0, &desc);
-  if (desc.Format != D3DFMT_A16B16G16R16F) return true;
+  if (desc.Format != D3DFMT_A16B16G16R16F) return nullptr;
   untonemapped_texture = MatchTexture(device, untonemapped_texture, desc);
-  if (untonemapped_texture == nullptr) return true;
+  if (untonemapped_texture == nullptr) return nullptr;
   IDirect3DSurface9* source = nullptr;
   IDirect3DSurface9* keep = nullptr;
   copy->GetSurfaceLevel(0, &source);
   untonemapped_texture->GetSurfaceLevel(0, &keep);
   device->StretchRect(source, nullptr, keep, nullptr, D3DTEXF_NONE);
+  keep->Release();
+  return source;
+}
+
+bool OnVanillaHistogramDraw(reshade::api::command_list* cmd_list) {
+  auto* device = GetNativeDevice(cmd_list);
+  IDirect3DSurface9* source = CaptureSceneCopy(device);
+  if (source == nullptr) return true;
   IDirect3DBaseTexture9* inputs[] = {untonemapped_texture};
   DrawFullscreen(device, PostShader(device, &encode_scene_shader, __encode_scene), inputs, source);
-  keep->Release();
   source->Release();
   device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, TRUE);
+  return true;
+}
+
+bool raw_scene_tone_mapped = false;
+
+bool OnUiDraw(reshade::api::command_list* cmd_list) {
+  if (!histogram_drawn || engine_post_drawn || bloom_chain_drawn || raw_scene_tone_mapped || untonemapped_texture == nullptr) return true;
+  raw_scene_tone_mapped = true;
+  auto* device = GetNativeDevice(cmd_list);
+  IDirect3DSurface9* target = nullptr;
+  if (FAILED(device->GetRenderTarget(0, &target)) || target == nullptr) return true;
+  D3DSURFACE_DESC desc = {};
+  target->GetDesc(&desc);
+  if (desc.Format == D3DFMT_A16B16G16R16F) {
+    const float params[4] = {0.f, 1.f, 0.f, 0.f};
+    IDirect3DBaseTexture9* inputs[] = {untonemapped_texture, untonemapped_texture, untonemapped_texture};
+    DrawFullscreen(device, PostShader(device, &post_upgrade_shader, __post_upgrade), inputs, target, params);
+    engine_post_drawn = true;
+  }
+  target->Release();
   return true;
 }
 
@@ -227,6 +252,7 @@ void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain*
   engine_post_drawn = false;
   bloom_chain_drawn = false;
   histogram_drawn = false;
+  raw_scene_tone_mapped = false;
 }
 
 IDirect3DBaseTexture9* bloom_add_previous_texture = nullptr;
@@ -235,11 +261,8 @@ DWORD bloom_add_previous_sampler_states[std::size(BLOOM_ADD_SAMPLER_STATES)] = {
 
 bool OnLuminanceCompareReplace(reshade::api::command_list* cmd_list) {
   auto* native_device = GetNativeDevice(cmd_list);
-  IDirect3DBaseTexture9* texture = nullptr;
-  native_device->GetTexture(0, &texture);
-  if (scene_copy_texture != nullptr) scene_copy_texture->Release();
-  scene_copy_texture = texture;
-  histogram_drawn = true;
+  IDirect3DSurface9* source = CaptureSceneCopy(native_device);
+  if (source != nullptr) source->Release();
   native_device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, TRUE);
   return true;
 }
@@ -318,7 +341,11 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     {0xCFB5A0D0, {.crc32 = 0xCFB5A0D0, .on_draw = &OnVanillaDownsampleDraw}},
     {0xF6ED64EA, {.crc32 = 0xF6ED64EA, .on_draw = &OnVanillaDownsampleDraw}},
     PORTAL2_ENGINE_POST_ENTRIES,
-    CustomShaderEntryCallback(0x23B789C1, &OnGammaSpaceDrawReplace),
+    {0x6236B99B, {.crc32 = 0x6236B99B, .on_draw = &OnUiDraw}},
+    {0xCFAFE6F6, {.crc32 = 0xCFAFE6F6, .on_draw = &OnUiDraw}},
+    {0x201ADBD3, {.crc32 = 0x201ADBD3, .on_draw = &OnUiDraw}},
+    {0x030AF021, {.crc32 = 0x030AF021, .on_draw = &OnUiDraw}},
+    {0x23B789C1, {.crc32 = 0x23B789C1, .code = __0x23B789C1, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
     CustomShaderEntryCallback(0x8837F356, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0x8E02BBBE, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0x0BF891AA, &OnGammaSpaceDrawReplace),
