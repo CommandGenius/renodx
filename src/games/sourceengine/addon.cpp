@@ -198,12 +198,21 @@ bool OnVanillaDownsampleDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
+float bloom_factor_weight = 0.5f;
+
 bool OnVanillaEnginePostDraw(reshade::api::command_list* cmd_list) {
   auto* device = GetNativeDevice(cmd_list);
   if (bloom_texture != nullptr) bloom_texture->Release();
   bloom_texture = nullptr;
   device->GetTexture(0, &bloom_texture);
   device->GetPixelShaderConstantF(5, bloom_factor, 1);
+  bloom_factor_weight = 0.5f;
+  return true;
+}
+
+bool OnVanillaEnginePostDrawFullBloom(reshade::api::command_list* cmd_list) {
+  OnVanillaEnginePostDraw(cmd_list);
+  bloom_factor_weight = 1.f;
   return true;
 }
 
@@ -221,7 +230,7 @@ void OnVanillaEnginePostDrawn(reshade::api::command_list* cmd_list) {
       device->StretchRect(target, nullptr, graded, nullptr, D3DTEXF_NONE);
       graded->Release();
       shader_injection.bloom_valid = bloom_chain_drawn ? 1.f : 0.f;
-      const float factor[4] = {bloom_factor[0] * 0.5f, 0.f, 0.f, 0.f};
+      const float factor[4] = {bloom_factor[0] * bloom_factor_weight, 0.f, 0.f, 0.f};
       IDirect3DBaseTexture9* inputs[] = {graded_texture, untonemapped_texture, bloom_texture};
       DrawFullscreen(device, PostShader(device, &post_upgrade_shader, __post_upgrade), inputs, target, factor);
       engine_post_drawn = true;
@@ -341,14 +350,19 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     ENGINE_POST_SHADER(0x831313E4),
     ENGINE_POST_SHADER(0xBB93772C),
     {0xEA4B3EE9, {.crc32 = 0xEA4B3EE9, .on_draw = &OnVanillaHistogramDraw}},
+    {0x5E9FC94B, {.crc32 = 0x5E9FC94B, .on_draw = &OnVanillaHistogramDraw}},
     {0xCFB5A0D0, {.crc32 = 0xCFB5A0D0, .on_draw = &OnVanillaDownsampleDraw}},
     {0xF6ED64EA, {.crc32 = 0xF6ED64EA, .on_draw = &OnVanillaDownsampleDraw}},
     PORTAL2_ENGINE_POST_ENTRIES,
+    L4D2_ENGINE_POST_ENTRIES,
     {0x6236B99B, {.crc32 = 0x6236B99B, .on_draw = &OnUiDraw}},
     {0xCFAFE6F6, {.crc32 = 0xCFAFE6F6, .on_draw = &OnUiDraw}},
     {0x201ADBD3, {.crc32 = 0x201ADBD3, .on_draw = &OnUiDraw}},
     {0x030AF021, {.crc32 = 0x030AF021, .on_draw = &OnUiDraw}},
     {0x23B789C1, {.crc32 = 0x23B789C1, .code = __0x23B789C1, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
+    {0x0DEE26BF, {.crc32 = 0x0DEE26BF, .code = __0x0DEE26BF, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
+    CustomShaderEntryCallback(0x51AF5BEF, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xAF2589CC, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0x8837F356, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0x8E02BBBE, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0x0BF891AA, &OnGammaSpaceDrawReplace),

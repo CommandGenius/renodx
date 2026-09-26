@@ -6,6 +6,9 @@
 #ifndef VERTEX_ALPHA
 #define VERTEX_ALPHA 0
 #endif
+#ifndef FOG_2D
+#define FOG_2D 0
+#endif
 
 sampler2D YTextureSampler  : register(s0);
 sampler2D cRTextureSampler : register(s1);
@@ -22,7 +25,12 @@ float4 main(float2 uv : TEXCOORD0, float3 worldPos : TEXCOORD1, float vertexAlph
       dot(ycc, float4(1.16412354f, -0.813476562f, -0.391448975f, 0.529705048f)),
       dot(ycc, float4(1.16412354f, 0.f, 2.01782227f, -1.08166885f)));
 #if (FOG == 1)
-  float fog = saturate(length(g_EyePos_SpecExponent.xyz - worldPos) * g_FogParams.w + g_FogParams.x);
+#if (FOG_2D == 1)
+  float fog_distance = length(g_EyePos_SpecExponent.xy - worldPos.xy);
+#else
+  float fog_distance = length(g_EyePos_SpecExponent.xyz - worldPos);
+#endif
+  float fog = saturate(fog_distance * g_FogParams.w + g_FogParams.x);
   fog = min(fog, g_FogParams.z);
   fog *= fog;
   rgb = lerp(rgb, g_LinearFogColor.rgb, fog);
