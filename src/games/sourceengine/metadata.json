@@ -1,0 +1,26 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "sourceengine",
+  "title": "Source Engine",
+  "status": "experimental",
+  "summary": "Adds HDR support to Source Engine games (integer HDR path) by upgrading the scene render targets and replacing engine_post with a tone mapper while keeping the software AA, bloom, and color-correction LUTs.",
+  "tags": [
+    "graphics",
+    "hdr",
+    "tone-mapping"
+  ],
+  "notes": [
+    "Run the game in its normal Direct3D 9 mode (no -vulkan). Load ReShade as d3d9.dll with DXVK underneath, like the other DX9 mods, so the D3D11/D3D12 swapchain proxy can present HDR and ps_3_0 replacements can pair with the game's vs_2_0 shaders.",
+    "Requires the game's HDR rendering (mat_hdr_level 2) so the scene is exposed by cLightScale before the RGBA16F targets.",
+    "Use borderless/windowed mode for HDR output."
+  ],
+  "deploy": {
+    "game_exe": "hl2.exe",
+    "process_name": "hl2",
+    "api": "d3d9",
+    "architecture": [
+      "x86",
+      "x64"
+    ]
+  }
+}
