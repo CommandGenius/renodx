@@ -137,6 +137,14 @@ void DrawFullscreen(IDirect3DDevice9* device, IDirect3DPixelShader9* shader, std
   state->Release();
 }
 
+DWORD sampler0_srgb_at_bind = 0;
+
+void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update) {
+  if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return;
+  if (update.type != reshade::api::descriptor_type::sampler_with_resource_view || update.binding != 0) return;
+  GetNativeDevice(cmd_list)->GetSamplerState(0, D3DSAMP_SRGBTEXTURE, &sampler0_srgb_at_bind);
+}
+
 IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   IDirect3DBaseTexture9* texture = nullptr;
   device->GetTexture(0, &texture);
@@ -146,6 +154,7 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   float light_scale[4] = {1.f, 1.f, 1.f, 1.f};
   device->GetPixelShaderConstantF(30, light_scale, 1);
   shader_injection.scene_exposure = light_scale[0] > 0.f ? 1.f / light_scale[0] : 1.f;
+  shader_injection.linear_input = sampler0_srgb_at_bind != 0 ? 1.f : 2.f;
   if (texture == nullptr || texture->GetType() != D3DRTYPE_TEXTURE) return nullptr;
   auto* copy = static_cast<IDirect3DTexture9*>(texture);
   D3DSURFACE_DESC desc = {};
@@ -160,17 +169,6 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   device->StretchRect(source, nullptr, keep, nullptr, D3DTEXF_NONE);
   keep->Release();
   return source;
-}
-
-bool OnVanillaHistogramDraw(reshade::api::command_list* cmd_list) {
-  auto* device = GetNativeDevice(cmd_list);
-  IDirect3DSurface9* source = CaptureSceneCopy(device);
-  if (source == nullptr) return true;
-  IDirect3DBaseTexture9* inputs[] = {untonemapped_texture};
-  DrawFullscreen(device, PostShader(device, &encode_scene_shader, __encode_scene), inputs, source);
-  source->Release();
-  device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, TRUE);
-  return true;
 }
 
 bool raw_scene_tone_mapped = false;
@@ -193,12 +191,67 @@ bool OnUiDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
+IDirect3DTexture9* encoded_texture = nullptr;
+IDirect3DBaseTexture9* previous_texture_slot[2] = {};
+
+bool BoundTextureIsSceneCopy(IDirect3DDevice9* device, DWORD slot) {
+  if (engine_post_drawn) return false;
+  IDirect3DBaseTexture9* texture = nullptr;
+  device->GetTexture(slot, &texture);
+  const bool matches = texture != nullptr && texture == scene_copy_texture;
+  if (texture != nullptr) texture->Release();
+  return matches;
+}
+
+void SwapTextureSlot(IDirect3DDevice9* device, DWORD slot, IDirect3DBaseTexture9* replacement) {
+  previous_texture_slot[slot] = nullptr;
+  device->GetTexture(slot, &previous_texture_slot[slot]);
+  device->SetTexture(slot, replacement);
+}
+
+void RestoreTextureSlot(IDirect3DDevice9* device, DWORD slot) {
+  device->SetTexture(slot, previous_texture_slot[slot]);
+  if (previous_texture_slot[slot] != nullptr) previous_texture_slot[slot]->Release();
+  previous_texture_slot[slot] = nullptr;
+}
+
+bool downsample_swapped = false;
+
 bool OnVanillaDownsampleDraw(reshade::api::command_list* cmd_list) {
+  auto* device = GetNativeDevice(cmd_list);
+  downsample_swapped = untonemapped_texture != nullptr && histogram_drawn && BoundTextureIsSceneCopy(device, 0);
+  shader_injection.linear_input = (!downsample_swapped && untonemapped_texture != nullptr && histogram_drawn) ? 2.f : 0.f;
+  if (!downsample_swapped) return true;
   bloom_chain_drawn = true;
+  D3DSURFACE_DESC desc = {};
+  untonemapped_texture->GetLevelDesc(0, &desc);
+  encoded_texture = MatchTexture(device, encoded_texture, desc);
+  IDirect3DSurface9* target = nullptr;
+  if (encoded_texture != nullptr && SUCCEEDED(encoded_texture->GetSurfaceLevel(0, &target))) {
+    IDirect3DBaseTexture9* inputs[] = {untonemapped_texture};
+    DrawFullscreen(device, PostShader(device, &encode_scene_shader, __encode_scene), inputs, target);
+    target->Release();
+  }
+  SwapTextureSlot(device, 0, encoded_texture);
   return true;
 }
 
+bool OnVanillaDownsampleLinearDraw(reshade::api::command_list* cmd_list) {
+  auto* device = GetNativeDevice(cmd_list);
+  downsample_swapped = untonemapped_texture != nullptr && histogram_drawn && BoundTextureIsSceneCopy(device, 0);
+  if (!downsample_swapped) return true;
+  bloom_chain_drawn = true;
+  SwapTextureSlot(device, 0, untonemapped_texture);
+  return true;
+}
+
+void OnVanillaDownsampleDrawn(reshade::api::command_list* cmd_list) {
+  if (downsample_swapped) RestoreTextureSlot(GetNativeDevice(cmd_list), 0);
+  downsample_swapped = false;
+}
+
 float bloom_factor_weight = 0.5f;
+bool post_swapped = false;
 
 bool OnVanillaEnginePostDraw(reshade::api::command_list* cmd_list) {
   auto* device = GetNativeDevice(cmd_list);
@@ -207,6 +260,8 @@ bool OnVanillaEnginePostDraw(reshade::api::command_list* cmd_list) {
   device->GetTexture(0, &bloom_texture);
   device->GetPixelShaderConstantF(5, bloom_factor, 1);
   bloom_factor_weight = 0.5f;
+  post_swapped = encoded_texture != nullptr && histogram_drawn && BoundTextureIsSceneCopy(device, 1);
+  if (post_swapped) SwapTextureSlot(device, 1, encoded_texture);
   return true;
 }
 
@@ -219,6 +274,8 @@ bool OnVanillaEnginePostDrawFullBloom(reshade::api::command_list* cmd_list) {
 void OnVanillaEnginePostDrawn(reshade::api::command_list* cmd_list) {
   if (untonemapped_texture == nullptr || !histogram_drawn) return;
   auto* device = GetNativeDevice(cmd_list);
+  if (post_swapped) RestoreTextureSlot(device, 1);
+  post_swapped = false;
   IDirect3DSurface9* target = nullptr;
   if (FAILED(device->GetRenderTarget(0, &target)) || target == nullptr) return;
   D3DSURFACE_DESC desc = {};
@@ -241,7 +298,7 @@ void OnVanillaEnginePostDrawn(reshade::api::command_list* cmd_list) {
 
 void OnDestroyDevice(reshade::api::device* device) {
   if (device->get_api() != reshade::api::device_api::d3d9) return;
-  for (auto** texture : {&untonemapped_texture, &graded_texture}) {
+  for (auto** texture : {&untonemapped_texture, &graded_texture, &encoded_texture}) {
     if (*texture != nullptr) (*texture)->Release();
     *texture = nullptr;
   }
@@ -349,10 +406,14 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0x5C3593EB, &OnBloomDownsampleReplace),
     ENGINE_POST_SHADER(0x831313E4),
     ENGINE_POST_SHADER(0xBB93772C),
-    {0xEA4B3EE9, {.crc32 = 0xEA4B3EE9, .on_draw = &OnVanillaHistogramDraw}},
-    {0x5E9FC94B, {.crc32 = 0x5E9FC94B, .on_draw = &OnVanillaHistogramDraw}},
-    {0xCFB5A0D0, {.crc32 = 0xCFB5A0D0, .on_draw = &OnVanillaDownsampleDraw}},
-    {0xF6ED64EA, {.crc32 = 0xF6ED64EA, .on_draw = &OnVanillaDownsampleDraw}},
+    {0xEA4B3EE9, {.crc32 = 0xEA4B3EE9, .code = __0xEA4B3EE9, .on_replace = &OnLuminanceCompareReplace}},
+    {0x5E9FC94B, {.crc32 = 0x5E9FC94B, .code = __0x5E9FC94B, .on_replace = &OnLuminanceCompareReplace}},
+    {0xCFB5A0D0, {.crc32 = 0xCFB5A0D0, .code = __0xCFB5A0D0, .on_replace = &OnVanillaDownsampleDraw, .on_drawn = &OnVanillaDownsampleDrawn}},
+    {0xF6ED64EA, {.crc32 = 0xF6ED64EA, .code = __0xF6ED64EA, .on_replace = &OnVanillaDownsampleLinearDraw, .on_drawn = &OnVanillaDownsampleDrawn}},
+    CustomShaderEntry(0xF820D96F),
+    CustomShaderEntry(0x9D06155A),
+    CustomShaderEntry(0xF990E8E5),
+    CustomShaderEntry(0x9010CD7F),
     PORTAL2_ENGINE_POST_ENTRIES,
     L4D2_ENGINE_POST_ENTRIES,
     {0x6236B99B, {.crc32 = 0x6236B99B, .on_draw = &OnUiDraw}},
@@ -361,6 +422,9 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     {0x030AF021, {.crc32 = 0x030AF021, .on_draw = &OnUiDraw}},
     {0x23B789C1, {.crc32 = 0x23B789C1, .code = __0x23B789C1, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
     {0x0DEE26BF, {.crc32 = 0x0DEE26BF, .code = __0x0DEE26BF, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
+    {0xEE27D62A, {.crc32 = 0xEE27D62A, .code = __0xEE27D62A, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
+    {0xBB6A22F0, {.crc32 = 0xBB6A22F0, .code = __0xBB6A22F0, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
+    {0x20B2481D, {.crc32 = 0x20B2481D, .code = __0x20B2481D, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
     CustomShaderEntryCallback(0x51AF5BEF, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0xAF2589CC, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0x8837F356, &OnGammaSpaceDrawReplace),
@@ -903,6 +967,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         }
 
         reshade::register_event<reshade::addon_event::present>(OnScenePresent);
+        reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
 
         initialized = true;
