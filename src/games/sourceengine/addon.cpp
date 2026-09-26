@@ -19,6 +19,7 @@
 #include "../../mods/shader.hpp"
 #include "../../mods/swapchain.hpp"
 #include "../../utils/settings.hpp"
+#include "./portal2_hashes.hpp"
 #include "./shared.h"
 
 namespace {
@@ -42,6 +43,178 @@ IDirect3DDevice9* GetNativeDevice(reshade::api::command_list* cmd_list) {
   return reinterpret_cast<IDirect3DDevice9*>(cmd_list->get_device()->get_native());
 }
 
+bool OnGammaSpaceDrawReplace(reshade::api::command_list* cmd_list) {
+  DWORD srgb_write = 0;
+  GetNativeDevice(cmd_list)->GetRenderState(D3DRS_SRGBWRITEENABLE, &srgb_write);
+  shader_injection.srgb_write_off = srgb_write == 0 ? 1.f : 0.f;
+  return true;
+}
+
+IDirect3DTexture9* untonemapped_texture = nullptr;
+IDirect3DTexture9* graded_texture = nullptr;
+IDirect3DBaseTexture9* bloom_texture = nullptr;
+float bloom_factor[4] = {};
+IDirect3DPixelShader9* encode_scene_shader = nullptr;
+IDirect3DPixelShader9* post_upgrade_shader = nullptr;
+IDirect3DDevice9* post_shader_device = nullptr;
+
+IDirect3DTexture9* MatchTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture, const D3DSURFACE_DESC& desc) {
+  D3DSURFACE_DESC current = {};
+  if (texture != nullptr && SUCCEEDED(texture->GetLevelDesc(0, &current)) && current.Width == desc.Width && current.Height == desc.Height && current.Format == desc.Format) {
+    return texture;
+  }
+  if (texture != nullptr) texture->Release();
+  texture = nullptr;
+  device->CreateTexture(desc.Width, desc.Height, 1, D3DUSAGE_RENDERTARGET, desc.Format, D3DPOOL_DEFAULT, &texture, nullptr);
+  return texture;
+}
+
+IDirect3DPixelShader9* PostShader(IDirect3DDevice9* device, IDirect3DPixelShader9** shader, std::span<const uint8_t> code) {
+  if (post_shader_device != device) {
+    if (encode_scene_shader != nullptr) encode_scene_shader->Release();
+    if (post_upgrade_shader != nullptr) post_upgrade_shader->Release();
+    encode_scene_shader = post_upgrade_shader = nullptr;
+    post_shader_device = device;
+  }
+  if (*shader == nullptr) device->CreatePixelShader(reinterpret_cast<const DWORD*>(code.data()), shader);
+  return *shader;
+}
+
+void DrawFullscreen(IDirect3DDevice9* device, IDirect3DPixelShader9* shader, std::span<IDirect3DBaseTexture9* const> textures, IDirect3DSurface9* target, const float* constants_c0 = nullptr) {
+  if (shader == nullptr || target == nullptr) return;
+  D3DSURFACE_DESC target_desc = {};
+  target->GetDesc(&target_desc);
+  IDirect3DStateBlock9* state = nullptr;
+  if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &state))) return;
+  IDirect3DSurface9* previous_target = nullptr;
+  device->GetRenderTarget(0, &previous_target);
+  IDirect3DSurface9* previous_depth = nullptr;
+  device->GetDepthStencilSurface(&previous_depth);
+
+  device->SetRenderTarget(0, target);
+  device->SetDepthStencilSurface(nullptr);
+  device->SetVertexShader(nullptr);
+  device->SetPixelShader(shader);
+  if (constants_c0 != nullptr) device->SetPixelShaderConstantF(0, constants_c0, 1);
+  device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+  for (DWORD slot = 0; slot < textures.size(); ++slot) {
+    device->SetTexture(slot, textures[slot]);
+    device->SetSamplerState(slot, D3DSAMP_SRGBTEXTURE, FALSE);
+    device->SetSamplerState(slot, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(slot, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(slot, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    device->SetSamplerState(slot, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    device->SetSamplerState(slot, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+  }
+  device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+  device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+  device->SetRenderState(D3DRS_ZENABLE, FALSE);
+  device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+  device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+  device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+  device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+  device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+  device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+  device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+  const D3DVIEWPORT9 viewport = {0, 0, target_desc.Width, target_desc.Height, 0.f, 1.f};
+  device->SetViewport(&viewport);
+
+  const float w = static_cast<float>(target_desc.Width) - 0.5f;
+  const float h = static_cast<float>(target_desc.Height) - 0.5f;
+  const float quad[4][6] = {
+      {-0.5f, -0.5f, 0.f, 1.f, 0.f, 0.f},
+      {w, -0.5f, 0.f, 1.f, 1.f, 0.f},
+      {-0.5f, h, 0.f, 1.f, 0.f, 1.f},
+      {w, h, 0.f, 1.f, 1.f, 1.f},
+  };
+  device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0]));
+
+  device->SetRenderTarget(0, previous_target);
+  device->SetDepthStencilSurface(previous_depth);
+  if (previous_target != nullptr) previous_target->Release();
+  if (previous_depth != nullptr) previous_depth->Release();
+  state->Apply();
+  state->Release();
+}
+
+bool OnVanillaHistogramDraw(reshade::api::command_list* cmd_list) {
+  auto* device = GetNativeDevice(cmd_list);
+  IDirect3DBaseTexture9* texture = nullptr;
+  device->GetTexture(0, &texture);
+  if (texture == nullptr) return true;
+  if (scene_copy_texture != nullptr) scene_copy_texture->Release();
+  scene_copy_texture = texture;
+  histogram_drawn = true;
+  if (texture->GetType() != D3DRTYPE_TEXTURE) return true;
+  auto* copy = static_cast<IDirect3DTexture9*>(texture);
+  D3DSURFACE_DESC desc = {};
+  copy->GetLevelDesc(0, &desc);
+  if (desc.Format != D3DFMT_A16B16G16R16F) return true;
+  untonemapped_texture = MatchTexture(device, untonemapped_texture, desc);
+  if (untonemapped_texture == nullptr) return true;
+  IDirect3DSurface9* source = nullptr;
+  IDirect3DSurface9* keep = nullptr;
+  copy->GetSurfaceLevel(0, &source);
+  untonemapped_texture->GetSurfaceLevel(0, &keep);
+  device->StretchRect(source, nullptr, keep, nullptr, D3DTEXF_NONE);
+  IDirect3DBaseTexture9* inputs[] = {untonemapped_texture};
+  DrawFullscreen(device, PostShader(device, &encode_scene_shader, __encode_scene), inputs, source);
+  keep->Release();
+  source->Release();
+  device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, TRUE);
+  return true;
+}
+
+bool OnVanillaDownsampleDraw(reshade::api::command_list* cmd_list) {
+  bloom_chain_drawn = true;
+  return true;
+}
+
+bool OnVanillaEnginePostDraw(reshade::api::command_list* cmd_list) {
+  auto* device = GetNativeDevice(cmd_list);
+  if (bloom_texture != nullptr) bloom_texture->Release();
+  bloom_texture = nullptr;
+  device->GetTexture(0, &bloom_texture);
+  device->GetPixelShaderConstantF(5, bloom_factor, 1);
+  return true;
+}
+
+void OnVanillaEnginePostDrawn(reshade::api::command_list* cmd_list) {
+  if (untonemapped_texture == nullptr || !histogram_drawn) return;
+  auto* device = GetNativeDevice(cmd_list);
+  IDirect3DSurface9* target = nullptr;
+  if (FAILED(device->GetRenderTarget(0, &target)) || target == nullptr) return;
+  D3DSURFACE_DESC desc = {};
+  target->GetDesc(&desc);
+  if (desc.Format == D3DFMT_A16B16G16R16F) {
+    graded_texture = MatchTexture(device, graded_texture, desc);
+    IDirect3DSurface9* graded = nullptr;
+    if (graded_texture != nullptr && SUCCEEDED(graded_texture->GetSurfaceLevel(0, &graded))) {
+      device->StretchRect(target, nullptr, graded, nullptr, D3DTEXF_NONE);
+      graded->Release();
+      shader_injection.bloom_valid = bloom_chain_drawn ? 1.f : 0.f;
+      const float factor[4] = {bloom_factor[0] * 0.5f, 0.f, 0.f, 0.f};
+      IDirect3DBaseTexture9* inputs[] = {graded_texture, untonemapped_texture, bloom_texture};
+      DrawFullscreen(device, PostShader(device, &post_upgrade_shader, __post_upgrade), inputs, target, factor);
+      engine_post_drawn = true;
+    }
+  }
+  target->Release();
+}
+
+void OnDestroyDevice(reshade::api::device* device) {
+  if (device->get_api() != reshade::api::device_api::d3d9) return;
+  for (auto** texture : {&untonemapped_texture, &graded_texture}) {
+    if (*texture != nullptr) (*texture)->Release();
+    *texture = nullptr;
+  }
+  for (auto** shader : {&encode_scene_shader, &post_upgrade_shader}) {
+    if (*shader != nullptr) (*shader)->Release();
+    *shader = nullptr;
+  }
+  post_shader_device = nullptr;
+}
+
 bool OnEnginePostReplace(reshade::api::command_list* cmd_list) {
   shader_injection.bloom_valid = bloom_chain_drawn ? 1.f : 0.f;
   engine_post_drawn = true;
@@ -57,6 +230,8 @@ void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain*
 }
 
 IDirect3DBaseTexture9* bloom_add_previous_texture = nullptr;
+const D3DSAMPLERSTATETYPE BLOOM_ADD_SAMPLER_STATES[] = {D3DSAMP_SRGBTEXTURE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER};
+DWORD bloom_add_previous_sampler_states[std::size(BLOOM_ADD_SAMPLER_STATES)] = {};
 
 bool OnLuminanceCompareReplace(reshade::api::command_list* cmd_list) {
   auto* native_device = GetNativeDevice(cmd_list);
@@ -78,6 +253,9 @@ bool OnBloomAddReplace(reshade::api::command_list* cmd_list) {
   bloom_add_previous_texture = nullptr;
   native_device->GetTexture(1, &bloom_add_previous_texture);
   native_device->SetTexture(1, scene_copy_texture);
+  for (size_t i = 0; i < std::size(BLOOM_ADD_SAMPLER_STATES); ++i) {
+    native_device->GetSamplerState(1, BLOOM_ADD_SAMPLER_STATES[i], &bloom_add_previous_sampler_states[i]);
+  }
   native_device->SetSamplerState(1, D3DSAMP_SRGBTEXTURE, FALSE);
   native_device->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
   native_device->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
@@ -96,6 +274,9 @@ void OnBloomAddDrawn(reshade::api::command_list* cmd_list) {
   if (bloom_add_previous_texture != nullptr) {
     bloom_add_previous_texture->Release();
     bloom_add_previous_texture = nullptr;
+  }
+  for (size_t i = 0; i < std::size(BLOOM_ADD_SAMPLER_STATES); ++i) {
+    native_device->SetSamplerState(1, BLOOM_ADD_SAMPLER_STATES[i], bloom_add_previous_sampler_states[i]);
   }
   native_device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
 }
@@ -133,6 +314,15 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0x5C3593EB, &OnBloomDownsampleReplace),
     ENGINE_POST_SHADER(0x831313E4),
     ENGINE_POST_SHADER(0xBB93772C),
+    {0xEA4B3EE9, {.crc32 = 0xEA4B3EE9, .on_draw = &OnVanillaHistogramDraw}},
+    {0xCFB5A0D0, {.crc32 = 0xCFB5A0D0, .on_draw = &OnVanillaDownsampleDraw}},
+    {0xF6ED64EA, {.crc32 = 0xF6ED64EA, .on_draw = &OnVanillaDownsampleDraw}},
+    PORTAL2_ENGINE_POST_ENTRIES,
+    CustomShaderEntryCallback(0x23B789C1, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x8837F356, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x8E02BBBE, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x0BF891AA, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xCAC51D67, &OnGammaSpaceDrawReplace),
     __ALL_CUSTOM_SHADERS,
 };
 
@@ -651,6 +841,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         }
 
         reshade::register_event<reshade::addon_event::present>(OnScenePresent);
+        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
 
         initialized = true;
       }

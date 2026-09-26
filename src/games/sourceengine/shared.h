@@ -77,10 +77,13 @@ struct ShaderInjectData {
 
   float swap_chain_encoding;
   float swap_chain_encoding_color_space;
-  float scene_tone_mapped;  // 1 when engine_post/bloomadd tone-mapped this frame, else the proxy clamps to SDR
+  float scene_tone_mapped;
   float bloom_valid;
 
   float custom_flip_uv_y;
+  float srgb_write_off;
+  float padding0;
+  float padding1;
 };
 
 #ifndef __cplusplus
@@ -121,6 +124,7 @@ float4 shader_injection[9] : register(c210);
 #define RENODX_SCENE_TONE_MAPPED               shader_injection[7][2]
 #define RENODX_BLOOM_VALID                     shader_injection[7][3]
 #define RENODX_CUSTOM_FLIP_UV_Y                shader_injection[8][0]
+#define RENODX_SRGB_WRITE_OFF                  shader_injection[8][1]
 
 #define RENODX_RENO_DRT_TONE_MAP_METHOD renodx::tonemap::renodrt::config::tone_map_method::REINHARD
 #else
@@ -168,6 +172,7 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_SCENE_TONE_MAPPED               shader_injection.scene_tone_mapped
 #define RENODX_BLOOM_VALID                     shader_injection.bloom_valid
 #define RENODX_CUSTOM_FLIP_UV_Y                shader_injection.custom_flip_uv_y
+#define RENODX_SRGB_WRITE_OFF                  shader_injection.srgb_write_off
 #define RENODX_RENO_DRT_TONE_MAP_METHOD        renodx::tonemap::renodrt::config::tone_map_method::REINHARD
 
 #endif

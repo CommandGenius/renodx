@@ -36,4 +36,9 @@ float3 ToneMapScene(float3 untonemapped) {
   return renodx::draw::RenderIntermediatePass(renodx::draw::ToneMapPass(untonemapped));
 }
 
+float3 GammaSpaceOutput(float3 color) {
+  if (RENODX_SRGB_WRITE_OFF == 1.f) return renodx::color::srgb::Decode(saturate(color));
+  return color;
+}
+
 #endif  // SRC_SOURCEENGINE_COMMON_HLSL_
