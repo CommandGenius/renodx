@@ -9,6 +9,7 @@
 
 #define RENODX_MODS_SWAPCHAIN_VERSION 2
 
+#include <d3d11.h>
 #include <d3d9.h>
 
 #include <deps/imgui/imgui.h>
@@ -18,6 +19,7 @@
 
 #include "../../mods/shader.hpp"
 #include "../../mods/swapchain.hpp"
+#include "../../utils/directx.hpp"
 #include "../../utils/settings.hpp"
 #include "./portal2_hashes.hpp"
 #include "./shared.h"
@@ -48,6 +50,88 @@ bool OnGammaSpaceDrawReplace(reshade::api::command_list* cmd_list) {
   GetNativeDevice(cmd_list)->GetRenderState(D3DRS_SRGBWRITEENABLE, &srgb_write);
   shader_injection.srgb_write_off = srgb_write == 0 ? 1.f : 0.f;
   return true;
+}
+
+using CreateTextureFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*);
+CreateTextureFunction original_create_texture = nullptr;
+ID3D11Device* shared_texture_device = nullptr;
+std::unordered_map<uint64_t, ID3D11Texture2D*> shared_textures;
+std::mutex shared_textures_mutex;
+
+HRESULT STDMETHODCALLTYPE OnCreateTexture(
+    IDirect3DDevice9* device, UINT width, UINT height, UINT levels, DWORD usage,
+    D3DFORMAT format, D3DPOOL pool, IDirect3DTexture9** texture, HANDLE* shared_handle) {
+  DXGI_FORMAT dxgi_format = DXGI_FORMAT_UNKNOWN;
+  if (format == D3DFMT_A8R8G8B8) dxgi_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  if (format == D3DFMT_X8R8G8B8) dxgi_format = DXGI_FORMAT_B8G8R8X8_UNORM;
+  if (format == D3DFMT_A16B16G16R16F) dxgi_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  if (shared_handle == nullptr || *shared_handle != nullptr || pool != D3DPOOL_DEFAULT
+      || levels > 1 || dxgi_format == DXGI_FORMAT_UNKNOWN) {
+    return original_create_texture(device, width, height, levels, usage, format, pool, texture, shared_handle);
+  }
+
+  std::scoped_lock lock(shared_textures_mutex);
+  if (shared_texture_device == nullptr && renodx::utils::directx::Initialize()) {
+    renodx::utils::directx::pD3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+        &shared_texture_device, nullptr, nullptr);
+  }
+  ID3D11Texture2D* shared_texture = nullptr;
+  IDXGIResource* dxgi_resource = nullptr;
+  HANDLE handle = nullptr;
+  if (shared_texture_device != nullptr) {
+    const D3D11_TEXTURE2D_DESC desc = {
+        .Width = width,
+        .Height = height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = dxgi_format,
+        .SampleDesc = {.Count = 1},
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
+        .MiscFlags = D3D11_RESOURCE_MISC_SHARED,
+    };
+    if (SUCCEEDED(shared_texture_device->CreateTexture2D(&desc, nullptr, &shared_texture))
+        && SUCCEEDED(shared_texture->QueryInterface(IID_PPV_ARGS(&dxgi_resource)))) {
+      dxgi_resource->GetSharedHandle(&handle);
+      dxgi_resource->Release();
+    }
+  }
+  if (handle != nullptr) {
+    *shared_handle = handle;
+    const HRESULT hr = original_create_texture(device, width, height, levels, usage, format, pool, texture, shared_handle);
+    if (SUCCEEDED(hr)) {
+      shared_textures[reinterpret_cast<uint64_t>(*texture)] = shared_texture;
+      std::stringstream info;
+      info << "[sourceengine] shared texture " << width << "x" << height << " format " << format << " created on D3D11";
+      reshade::log::message(reshade::log::level::info, info.str().c_str());
+      return hr;
+    }
+    *shared_handle = nullptr;
+  }
+  if (shared_texture != nullptr) shared_texture->Release();
+  reshade::log::message(reshade::log::level::warning, "[sourceengine] shared texture fell back to D3D9 creation");
+  return original_create_texture(device, width, height, levels, usage, format, pool, texture, shared_handle);
+}
+
+void OnInitDevice(reshade::api::device* device) {
+  if (device->get_api() != reshade::api::device_api::d3d9 || original_create_texture != nullptr) return;
+  void** vtable = *reinterpret_cast<void***>(device->get_native());
+  DWORD protect = 0;
+  if (!VirtualProtect(&vtable[23], sizeof(void*), PAGE_READWRITE, &protect)) return;
+  original_create_texture = reinterpret_cast<CreateTextureFunction>(vtable[23]);
+  vtable[23] = reinterpret_cast<void*>(&OnCreateTexture);
+  VirtualProtect(&vtable[23], sizeof(void*), protect, &protect);
+}
+
+void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource) {
+  if (device->get_api() != reshade::api::device_api::d3d9) return;
+  std::scoped_lock lock(shared_textures_mutex);
+  if (auto it = shared_textures.find(resource.handle); it != shared_textures.end()) {
+    it->second->Release();
+    shared_textures.erase(it);
+  }
 }
 
 IDirect3DTexture9* untonemapped_texture = nullptr;
@@ -408,6 +492,11 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     ENGINE_POST_SHADER(0xBB93772C),
     {0xEA4B3EE9, {.crc32 = 0xEA4B3EE9, .code = __0xEA4B3EE9, .on_replace = &OnLuminanceCompareReplace}},
     {0x5E9FC94B, {.crc32 = 0x5E9FC94B, .code = __0x5E9FC94B, .on_replace = &OnLuminanceCompareReplace}},
+    {0xE0D9427D, {.crc32 = 0xE0D9427D, .code = __0xE0D9427D, .on_replace = &OnLuminanceCompareReplace}},
+    {0x16C33CB7, {.crc32 = 0x16C33CB7, .on_draw = &OnVanillaDownsampleDraw, .on_drawn = &OnVanillaDownsampleDrawn}},
+    {0x5EBAB2E8, {.crc32 = 0x5EBAB2E8, .on_draw = &OnVanillaDownsampleDraw, .on_drawn = &OnVanillaDownsampleDrawn}},
+    {0x271A2CA1, {.crc32 = 0x271A2CA1, .on_draw = &OnVanillaDownsampleDraw, .on_drawn = &OnVanillaDownsampleDrawn}},
+    {0xB12B99BE, {.crc32 = 0xB12B99BE, .on_draw = &OnVanillaDownsampleDraw, .on_drawn = &OnVanillaDownsampleDrawn}},
     {0xCFB5A0D0, {.crc32 = 0xCFB5A0D0, .code = __0xCFB5A0D0, .on_replace = &OnVanillaDownsampleDraw, .on_drawn = &OnVanillaDownsampleDrawn}},
     {0xF6ED64EA, {.crc32 = 0xF6ED64EA, .code = __0xF6ED64EA, .on_replace = &OnVanillaDownsampleLinearDraw, .on_drawn = &OnVanillaDownsampleDrawn}},
     CustomShaderEntry(0xF820D96F),
@@ -416,6 +505,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x9010CD7F),
     PORTAL2_ENGINE_POST_ENTRIES,
     L4D2_ENGINE_POST_ENTRIES,
+    BLACKMESA_ENGINE_POST_ENTRIES,
     {0x6236B99B, {.crc32 = 0x6236B99B, .on_draw = &OnUiDraw}},
     {0xCFAFE6F6, {.crc32 = 0xCFAFE6F6, .on_draw = &OnUiDraw}},
     {0x201ADBD3, {.crc32 = 0x201ADBD3, .on_draw = &OnUiDraw}},
@@ -969,6 +1059,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         reshade::register_event<reshade::addon_event::present>(OnScenePresent);
         reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+        reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
 
         initialized = true;
       }
