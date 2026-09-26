@@ -24,7 +24,7 @@
 
 namespace {
 
-ShaderInjectData shader_injection;
+ShaderInjectData shader_injection = {.scene_exposure = 1.f};
 
 bool engine_post_drawn = false;
 
@@ -143,6 +143,9 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   if (scene_copy_texture != nullptr) scene_copy_texture->Release();
   scene_copy_texture = texture;
   histogram_drawn = true;
+  float light_scale[4] = {1.f, 1.f, 1.f, 1.f};
+  device->GetPixelShaderConstantF(30, light_scale, 1);
+  shader_injection.scene_exposure = light_scale[0] > 0.f ? 1.f / light_scale[0] : 1.f;
   if (texture == nullptr || texture->GetType() != D3DRTYPE_TEXTURE) return nullptr;
   auto* copy = static_cast<IDirect3DTexture9*>(texture);
   D3DSURFACE_DESC desc = {};
@@ -350,6 +353,24 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0x8E02BBBE, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0x0BF891AA, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0xCAC51D67, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x0842E39E, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x170AD9CC, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x1B84CD39, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x2263A555, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x2C39628C, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x36A5FFB0, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x4FDAD9B4, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x50CE71BB, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x591A1062, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x6387F691, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x69129D1B, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x8C2D1C85, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x8F1BCED2, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x9DEA8FAD, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xAF86C7DF, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xB51EBBA2, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xC640A8A5, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xCF6CC274, &OnGammaSpaceDrawReplace),
     __ALL_CUSTOM_SHADERS,
 };
 
