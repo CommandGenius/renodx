@@ -103,6 +103,27 @@ inline double Target(const std::array<double, BINS>& bins, double exposure, bool
   return std::max(target * exposure, 0.001);
 }
 
+constexpr int SETTLE_BINS_PER_DECADE = 200;
+constexpr int SETTLE_BINS = 6 * SETTLE_BINS_PER_DECADE;
+constexpr double SETTLE_LOWEST = 1e-3;
+constexpr double SETTLE_HIGHEST = 1e3;
+
+inline int SettleBin(double exposure) {
+  return std::clamp(static_cast<int>(std::floor(std::log10(exposure / SETTLE_LOWEST) * SETTLE_BINS_PER_DECADE)), 0, SETTLE_BINS - 1);
+}
+
+inline double MeanSettle(const std::array<double, SETTLE_BINS>& settles, double minimum, double maximum) {
+  double weight = 0.0;
+  double log_sum = 0.0;
+  for (int i = 0; i < SETTLE_BINS; ++i) {
+    if (settles[i] <= 0.0) continue;
+    const double center = SETTLE_LOWEST * std::pow(10.0, (i + 0.5) / SETTLE_BINS_PER_DECADE);
+    weight += settles[i];
+    log_sum += settles[i] * std::log(std::clamp(center, minimum, maximum));
+  }
+  return weight > 0.0 ? std::exp(log_sum / weight) : 0.0;
+}
+
 inline double Settle(const std::array<double, BINS>& bins, bool read_linear, bool original_algorithm, double minimum, double maximum) {
   double exposure = std::clamp(1.0, minimum, maximum);
   for (int step = 0; step < 400; ++step) {

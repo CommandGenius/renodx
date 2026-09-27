@@ -258,10 +258,11 @@ ExposureMeasurement exposure_measurements[EXPOSURE_FRAMES_IN_FLIGHT];
 int exposure_measurement_index = 0;
 IDirect3DTexture9* exposure_sample_texture = nullptr;
 IDirect3DTexture9* exposure_count_texture = nullptr;
-std::array<double, map_exposure::BINS> exposure_bins = {};
+std::array<double, map_exposure::SETTLE_BINS> exposure_settles = {};
 double exposure_frames = 0.0;
 uint32_t exposure_level = 0;
 float map_light_scale = 0.f;
+float level_light_scale_max = 0.f;
 
 void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update) {
   if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return;
@@ -270,14 +271,21 @@ void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shade
 }
 
 void TrackLevelLoad(float light_scale) {
-  static float previous_light_scale = 1.f;
-  if (light_scale == 1.f && std::abs(previous_light_scale - 1.f) > 0.01f * previous_light_scale) {
-    exposure_bins = {};
+  static auto previous_capture = std::chrono::steady_clock::time_point{};
+  static bool resumed = false;
+  const auto now = std::chrono::steady_clock::now();
+  resumed |= now - previous_capture > std::chrono::milliseconds(500);
+  previous_capture = now;
+  if (light_scale == 1.f) return;
+  if (resumed && light_scale < 0.97f * level_light_scale_max) {
+    exposure_settles = {};
     exposure_frames = 0.0;
     map_light_scale = 0.f;
+    level_light_scale_max = 0.f;
     ++exposure_level;
   }
-  previous_light_scale = light_scale;
+  resumed = false;
+  level_light_scale_max = std::max(level_light_scale_max, light_scale);
 }
 
 void CollectExposureMeasurement(ExposureMeasurement* measurement) {
@@ -289,21 +297,27 @@ void CollectExposureMeasurement(ExposureMeasurement* measurement) {
   }
   measurement->issued = false;
   if (measurement->level != exposure_level || total <= 0.0) return;
-  for (int i = 0; i < map_exposure::BINS; ++i) exposure_bins[i] += counts[i] / total;
-  exposure_frames += 1.0;
-  const auto frames = static_cast<int>(exposure_frames);
-  if (frames > 60 && frames % 15 != 0) return;
   std::array<double, map_exposure::BINS> share = {};
-  for (int i = 0; i < map_exposure::BINS; ++i) share[i] = exposure_bins[i] / exposure_frames;
-  const double maximum = current_light_scale;
-  map_light_scale = static_cast<float>(map_exposure::Settle(share, histogram_reads_linear, original_algorithm, std::min(0.5, maximum), maximum));
+  for (int i = 0; i < map_exposure::BINS; ++i) share[i] = counts[i] / total;
+  const double settled = map_exposure::Settle(share, histogram_reads_linear, original_algorithm, map_exposure::SETTLE_LOWEST, map_exposure::SETTLE_HIGHEST);
+  exposure_settles[map_exposure::SettleBin(settled)] += 1.0;
+  exposure_frames += 1.0;
+  const double maximum = level_light_scale_max > 0.f ? level_light_scale_max : 1.f;
+  map_light_scale = static_cast<float>(map_exposure::MeanSettle(exposure_settles, std::min(0.5, maximum), maximum));
 }
 
 void MeasureExposure(IDirect3DDevice9* device) {
   if (!light_scale_used || untonemapped_texture == nullptr || current_light_scale <= 0.f) return;
+  if (current_light_scale == 1.f && level_light_scale_max > 0.f) return;
+  for (auto& pending : exposure_measurements) {
+    if (pending.issued) CollectExposureMeasurement(&pending);
+  }
+  static auto previous_issue = std::chrono::steady_clock::time_point{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - previous_issue < std::chrono::milliseconds(50)) return;
   auto& measurement = exposure_measurements[exposure_measurement_index];
-  if (measurement.issued) CollectExposureMeasurement(&measurement);
   if (measurement.issued) return;
+  previous_issue = now;
   exposure_measurement_index = (exposure_measurement_index + 1) % EXPOSURE_FRAMES_IN_FLIGHT;
 
   for (auto*& query : measurement.queries) {
@@ -363,7 +377,7 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   if (current_light_scale != 1.f) light_scale_used = true;
   TrackLevelLoad(current_light_scale);
   if (current_light_scale > 0.f) {
-    const float shown = (light_scale_used && map_light_scale > 0.f) ? std::min(map_light_scale, current_light_scale) : 1.f;
+    const float shown = (light_scale_used && map_light_scale > 0.f) ? map_light_scale : 1.f;
     shader_injection.scene_exposure = shown / current_light_scale;
   }
   if (texture == nullptr || texture->GetType() != D3DRTYPE_TEXTURE) return nullptr;
@@ -794,7 +808,7 @@ renodx::utils::settings::Settings settings = {
         .key = "ToneMapScaling",
         .binding = &shader_injection.tone_map_per_channel,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f,
+        .default_value = 0.f,
         .label = "Scaling",
         .section = "Tone Mapping",
         .tooltip = "Luminance scales colors consistently while per-channel saturates and blows out sooner",
