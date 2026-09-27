@@ -229,6 +229,40 @@ void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shade
   GetNativeDevice(cmd_list)->GetSamplerState(0, D3DSAMP_SRGBTEXTURE, &sampler0_srgb_at_bind);
 }
 
+float held_light_scale = 0.f;
+float previous_light_scale = 1.f;
+float settle_reference_scale = 1.f;
+int settle_frames = 0;
+std::chrono::steady_clock::time_point settle_start_time = std::chrono::steady_clock::now();
+std::chrono::steady_clock::time_point settle_reference_time = settle_start_time;
+std::chrono::steady_clock::time_point last_histogram_time = settle_start_time;
+
+float HeldLightScale(float light_scale) {
+  const auto now = std::chrono::steady_clock::now();
+  const bool load_gap = now - last_histogram_time > std::chrono::seconds(1);
+  last_histogram_time = now;
+  if (light_scale == 1.f && (load_gap || std::abs(previous_light_scale - 1.f) > 0.01f * previous_light_scale)) {
+    held_light_scale = 0.f;
+    settle_frames = 0;
+    settle_start_time = now;
+  }
+  previous_light_scale = light_scale;
+  if (held_light_scale > 0.f) return held_light_scale;
+
+  if (++settle_frames < 64) {
+    settle_reference_scale = light_scale;
+    settle_reference_time = now;
+    return light_scale;
+  }
+  if (now - settle_reference_time >= std::chrono::milliseconds(250)) {
+    const bool settled = std::abs(light_scale - settle_reference_scale) <= 0.0025f * light_scale;
+    if (settled || now - settle_start_time >= std::chrono::seconds(10)) held_light_scale = light_scale;
+    settle_reference_scale = light_scale;
+    settle_reference_time = now;
+  }
+  return held_light_scale > 0.f ? held_light_scale : light_scale;
+}
+
 IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   IDirect3DBaseTexture9* texture = nullptr;
   device->GetTexture(0, &texture);
@@ -237,7 +271,10 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   histogram_drawn = true;
   float light_scale[4] = {1.f, 1.f, 1.f, 1.f};
   device->GetPixelShaderConstantF(30, light_scale, 1);
-  shader_injection.scene_exposure = (light_scale[0] > 0.f && light_scale[0] < 1.f) ? 1.f / light_scale[0] : 1.f;
+  if (light_scale[0] > 0.f) {
+    const float shown_scale = HeldLightScale(light_scale[0]);
+    shader_injection.scene_exposure = (shown_scale > 1.f ? shown_scale : 1.f) / light_scale[0];
+  }
   shader_injection.linear_input = sampler0_srgb_at_bind != 0 ? 1.f : 2.f;
   if (texture == nullptr || texture->GetType() != D3DRTYPE_TEXTURE) return nullptr;
   auto* copy = static_cast<IDirect3DTexture9*>(texture);
@@ -422,10 +459,37 @@ IDirect3DBaseTexture9* bloom_add_previous_texture = nullptr;
 const D3DSAMPLERSTATETYPE BLOOM_ADD_SAMPLER_STATES[] = {D3DSAMP_SRGBTEXTURE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER};
 DWORD bloom_add_previous_sampler_states[std::size(BLOOM_ADD_SAMPLER_STATES)] = {};
 
+void SetOriginalAlgorithmHold(float held_scale) {
+  const auto bucket_edge = [](int k) {
+    return -0.01 + std::exp(std::log(0.01) + (std::log(1.01) - std::log(0.01)) * k / 30.0);
+  };
+  const double mean = 0.15 / held_scale;
+  for (int k = 0; k < 29; ++k) {
+    const double low = (bucket_edge(k) + bucket_edge(k + 1)) * 0.5;
+    const double high = (bucket_edge(k + 1) + bucket_edge(k + 2)) * 0.5;
+    if (mean <= high || k == 28) {
+      shader_injection.histogram_hold_low = static_cast<float>(low);
+      shader_injection.histogram_hold_high = static_cast<float>(high);
+      shader_injection.histogram_hold_low_share = static_cast<float>(std::clamp((high - mean) / (high - low), 0.0, 1.0));
+      return;
+    }
+  }
+}
+
 bool OnLuminanceCompareReplace(reshade::api::command_list* cmd_list) {
   auto* native_device = GetNativeDevice(cmd_list);
   IDirect3DSurface9* source = CaptureSceneCopy(native_device);
   if (source != nullptr) source->Release();
+  float bucket[4] = {};
+  native_device->GetPixelShaderConstantF(0, bucket, 1);
+  static bool original_algorithm = false;
+  if (bucket[0] == 0.f && bucket[1] < 50000.f) original_algorithm = bucket[1] < 0.01f;
+  if (original_algorithm) {
+    if (held_light_scale > 0.f) SetOriginalAlgorithmHold(held_light_scale);
+    shader_injection.histogram_mode = held_light_scale > 0.f ? 3.f : 0.f;
+  } else {
+    shader_injection.histogram_mode = held_light_scale > 0.f ? 1.f : 2.f;
+  }
   native_device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, TRUE);
   return true;
 }
