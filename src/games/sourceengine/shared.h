@@ -84,17 +84,12 @@ struct ShaderInjectData {
   float srgb_write_off;
   float scene_exposure;
   float linear_input;
-
-  float histogram_mode;
-  float histogram_hold_low;
-  float histogram_hold_high;
-  float histogram_hold_low_share;
 };
 
 #ifndef __cplusplus
 #if (__SHADER_TARGET_MAJOR == 3)
 
-float4 shader_injection[10] : register(c210);
+float4 shader_injection[9] : register(c210);
 
 #define RENODX_PEAK_WHITE_NITS               shader_injection[0][0]
 #define RENODX_DIFFUSE_WHITE_NITS            shader_injection[0][1]
@@ -132,10 +127,6 @@ float4 shader_injection[10] : register(c210);
 #define RENODX_SRGB_WRITE_OFF                  shader_injection[8][1]
 #define RENODX_SCENE_EXPOSURE                  shader_injection[8][2]
 #define RENODX_LINEAR_INPUT                    shader_injection[8][3]
-#define RENODX_HISTOGRAM_MODE                  shader_injection[9][0]
-#define RENODX_HISTOGRAM_HOLD_LOW              shader_injection[9][1]
-#define RENODX_HISTOGRAM_HOLD_HIGH             shader_injection[9][2]
-#define RENODX_HISTOGRAM_HOLD_LOW_SHARE        shader_injection[9][3]
 
 #define RENODX_RENO_DRT_TONE_MAP_METHOD renodx::tonemap::renodrt::config::tone_map_method::REINHARD
 #else
@@ -186,10 +177,6 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_SRGB_WRITE_OFF                  shader_injection.srgb_write_off
 #define RENODX_SCENE_EXPOSURE                  shader_injection.scene_exposure
 #define RENODX_LINEAR_INPUT                    shader_injection.linear_input
-#define RENODX_HISTOGRAM_MODE                  shader_injection.histogram_mode
-#define RENODX_HISTOGRAM_HOLD_LOW              shader_injection.histogram_hold_low
-#define RENODX_HISTOGRAM_HOLD_HIGH             shader_injection.histogram_hold_high
-#define RENODX_HISTOGRAM_HOLD_LOW_SHARE        shader_injection.histogram_hold_low_share
 #define RENODX_RENO_DRT_TONE_MAP_METHOD        renodx::tonemap::renodrt::config::tone_map_method::REINHARD
 
 #endif

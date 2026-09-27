@@ -12,7 +12,6 @@ float3 Tap(float2 uv) {
 #if (LINEAR_INPUT == 1)
   tap = renodx::color::srgb::Encode(saturate(tap));
 #else
-  if (RENODX_LINEAR_INPUT == 1.f) tap = saturate(tap);
   if (RENODX_LINEAR_INPUT == 2.f) tap = renodx::color::srgb::Encode(saturate(tap));
 #endif
   return tap;

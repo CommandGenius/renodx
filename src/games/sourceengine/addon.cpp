@@ -21,6 +21,7 @@
 #include "../../mods/swapchain.hpp"
 #include "../../utils/directx.hpp"
 #include "../../utils/settings.hpp"
+#include "./map_exposure.hpp"
 #include "./portal2_hashes.hpp"
 #include "./shared.h"
 
@@ -140,6 +141,7 @@ IDirect3DBaseTexture9* bloom_texture = nullptr;
 float bloom_factor[4] = {};
 IDirect3DPixelShader9* encode_scene_shader = nullptr;
 IDirect3DPixelShader9* post_upgrade_shader = nullptr;
+IDirect3DPixelShader9* exposure_measure_shader = nullptr;
 IDirect3DDevice9* post_shader_device = nullptr;
 
 IDirect3DTexture9* MatchTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture, const D3DSURFACE_DESC& desc) {
@@ -157,71 +159,109 @@ IDirect3DPixelShader9* PostShader(IDirect3DDevice9* device, IDirect3DPixelShader
   if (post_shader_device != device) {
     if (encode_scene_shader != nullptr) encode_scene_shader->Release();
     if (post_upgrade_shader != nullptr) post_upgrade_shader->Release();
-    encode_scene_shader = post_upgrade_shader = nullptr;
+    if (exposure_measure_shader != nullptr) exposure_measure_shader->Release();
+    encode_scene_shader = post_upgrade_shader = exposure_measure_shader = nullptr;
     post_shader_device = device;
   }
   if (*shader == nullptr) device->CreatePixelShader(reinterpret_cast<const DWORD*>(code.data()), shader);
   return *shader;
 }
 
-void DrawFullscreen(IDirect3DDevice9* device, IDirect3DPixelShader9* shader, std::span<IDirect3DBaseTexture9* const> textures, IDirect3DSurface9* target, const float* constants_c0 = nullptr) {
-  if (shader == nullptr || target == nullptr) return;
-  D3DSURFACE_DESC target_desc = {};
-  target->GetDesc(&target_desc);
-  IDirect3DStateBlock9* state = nullptr;
-  if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &state))) return;
-  IDirect3DSurface9* previous_target = nullptr;
-  device->GetRenderTarget(0, &previous_target);
-  IDirect3DSurface9* previous_depth = nullptr;
-  device->GetDepthStencilSurface(&previous_depth);
+class FullscreenPass {
+ public:
+  FullscreenPass(IDirect3DDevice9* device, IDirect3DPixelShader9* shader, std::span<IDirect3DBaseTexture9* const> textures, IDirect3DSurface9* target)
+      : device_(device) {
+    if (shader == nullptr || target == nullptr || FAILED(device->CreateStateBlock(D3DSBT_ALL, &state_))) return;
+    D3DSURFACE_DESC target_desc = {};
+    target->GetDesc(&target_desc);
+    device->GetRenderTarget(0, &previous_target_);
+    device->GetDepthStencilSurface(&previous_depth_);
 
-  device->SetRenderTarget(0, target);
-  device->SetDepthStencilSurface(nullptr);
-  device->SetVertexShader(nullptr);
-  device->SetPixelShader(shader);
-  if (constants_c0 != nullptr) device->SetPixelShaderConstantF(0, constants_c0, 1);
-  device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-  for (DWORD slot = 0; slot < textures.size(); ++slot) {
-    device->SetTexture(slot, textures[slot]);
-    device->SetSamplerState(slot, D3DSAMP_SRGBTEXTURE, FALSE);
-    device->SetSamplerState(slot, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-    device->SetSamplerState(slot, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-    device->SetSamplerState(slot, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-    device->SetSamplerState(slot, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-    device->SetSamplerState(slot, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    device->SetRenderTarget(0, target);
+    device->SetDepthStencilSurface(nullptr);
+    device->SetVertexShader(nullptr);
+    device->SetPixelShader(shader);
+    device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    for (DWORD slot = 0; slot < textures.size(); ++slot) {
+      device->SetTexture(slot, textures[slot]);
+      device->SetSamplerState(slot, D3DSAMP_SRGBTEXTURE, FALSE);
+      device->SetSamplerState(slot, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+      device->SetSamplerState(slot, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+      device->SetSamplerState(slot, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+      device->SetSamplerState(slot, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+      device->SetSamplerState(slot, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    }
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+    device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+    const D3DVIEWPORT9 viewport = {0, 0, target_desc.Width, target_desc.Height, 0.f, 1.f};
+    device->SetViewport(&viewport);
+    width_ = static_cast<float>(target_desc.Width) - 0.5f;
+    height_ = static_cast<float>(target_desc.Height) - 0.5f;
   }
-  device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-  device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-  device->SetRenderState(D3DRS_ZENABLE, FALSE);
-  device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-  device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-  device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
-  device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-  device->SetRenderState(D3DRS_FOGENABLE, FALSE);
-  device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
-  device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
-  const D3DVIEWPORT9 viewport = {0, 0, target_desc.Width, target_desc.Height, 0.f, 1.f};
-  device->SetViewport(&viewport);
 
-  const float w = static_cast<float>(target_desc.Width) - 0.5f;
-  const float h = static_cast<float>(target_desc.Height) - 0.5f;
-  const float quad[4][6] = {
-      {-0.5f, -0.5f, 0.f, 1.f, 0.f, 0.f},
-      {w, -0.5f, 0.f, 1.f, 1.f, 0.f},
-      {-0.5f, h, 0.f, 1.f, 0.f, 1.f},
-      {w, h, 0.f, 1.f, 1.f, 1.f},
-  };
-  device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0]));
+  ~FullscreenPass() {
+    if (state_ == nullptr) return;
+    device_->SetRenderTarget(0, previous_target_);
+    device_->SetDepthStencilSurface(previous_depth_);
+    if (previous_target_ != nullptr) previous_target_->Release();
+    if (previous_depth_ != nullptr) previous_depth_->Release();
+    state_->Apply();
+    state_->Release();
+  }
 
-  device->SetRenderTarget(0, previous_target);
-  device->SetDepthStencilSurface(previous_depth);
-  if (previous_target != nullptr) previous_target->Release();
-  if (previous_depth != nullptr) previous_depth->Release();
-  state->Apply();
-  state->Release();
+  void Draw(const float* constants_c0 = nullptr) {
+    if (state_ == nullptr) return;
+    if (constants_c0 != nullptr) device_->SetPixelShaderConstantF(0, constants_c0, 1);
+    const float quad[4][6] = {
+        {-0.5f, -0.5f, 0.f, 1.f, 0.f, 0.f},
+        {width_, -0.5f, 0.f, 1.f, 1.f, 0.f},
+        {-0.5f, height_, 0.f, 1.f, 0.f, 1.f},
+        {width_, height_, 0.f, 1.f, 1.f, 1.f},
+    };
+    device_->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0]));
+  }
+
+ private:
+  IDirect3DDevice9* device_;
+  IDirect3DStateBlock9* state_ = nullptr;
+  IDirect3DSurface9* previous_target_ = nullptr;
+  IDirect3DSurface9* previous_depth_ = nullptr;
+  float width_ = 0.f;
+  float height_ = 0.f;
+};
+
+void DrawFullscreen(IDirect3DDevice9* device, IDirect3DPixelShader9* shader, std::span<IDirect3DBaseTexture9* const> textures, IDirect3DSurface9* target, const float* constants_c0 = nullptr) {
+  FullscreenPass(device, shader, textures, target).Draw(constants_c0);
 }
 
 DWORD sampler0_srgb_at_bind = 0;
+bool histogram_reads_linear = false;
+bool original_algorithm = false;
+float current_light_scale = 1.f;
+bool light_scale_used = false;
+
+constexpr int EXPOSURE_FRAMES_IN_FLIGHT = 3;
+struct ExposureMeasurement {
+  IDirect3DQuery9* queries[map_exposure::BINS] = {};
+  bool issued = false;
+  uint32_t level = 0;
+};
+ExposureMeasurement exposure_measurements[EXPOSURE_FRAMES_IN_FLIGHT];
+int exposure_measurement_index = 0;
+IDirect3DTexture9* exposure_sample_texture = nullptr;
+IDirect3DTexture9* exposure_count_texture = nullptr;
+std::array<double, map_exposure::BINS> exposure_bins = {};
+double exposure_frames = 0.0;
+uint32_t exposure_level = 0;
+float map_light_scale = 0.f;
 
 void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update) {
   if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return;
@@ -229,38 +269,85 @@ void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shade
   GetNativeDevice(cmd_list)->GetSamplerState(0, D3DSAMP_SRGBTEXTURE, &sampler0_srgb_at_bind);
 }
 
-float held_light_scale = 0.f;
-float previous_light_scale = 1.f;
-float settle_reference_scale = 1.f;
-int settle_frames = 0;
-std::chrono::steady_clock::time_point settle_start_time = std::chrono::steady_clock::now();
-std::chrono::steady_clock::time_point settle_reference_time = settle_start_time;
-std::chrono::steady_clock::time_point last_histogram_time = settle_start_time;
-
-float HeldLightScale(float light_scale) {
-  const auto now = std::chrono::steady_clock::now();
-  const bool load_gap = now - last_histogram_time > std::chrono::seconds(1);
-  last_histogram_time = now;
-  if (light_scale == 1.f && (load_gap || std::abs(previous_light_scale - 1.f) > 0.01f * previous_light_scale)) {
-    held_light_scale = 0.f;
-    settle_frames = 0;
-    settle_start_time = now;
+void TrackLevelLoad(float light_scale) {
+  static float previous_light_scale = 1.f;
+  if (light_scale == 1.f && std::abs(previous_light_scale - 1.f) > 0.01f * previous_light_scale) {
+    exposure_bins = {};
+    exposure_frames = 0.0;
+    map_light_scale = 0.f;
+    ++exposure_level;
   }
   previous_light_scale = light_scale;
-  if (held_light_scale > 0.f) return held_light_scale;
+}
 
-  if (++settle_frames < 64) {
-    settle_reference_scale = light_scale;
-    settle_reference_time = now;
-    return light_scale;
+void CollectExposureMeasurement(ExposureMeasurement* measurement) {
+  DWORD counts[map_exposure::BINS] = {};
+  double total = 0.0;
+  for (int i = 0; i < map_exposure::BINS; ++i) {
+    if (measurement->queries[i] == nullptr || measurement->queries[i]->GetData(&counts[i], sizeof(DWORD), 0) != S_OK) return;
+    total += counts[i];
   }
-  if (now - settle_reference_time >= std::chrono::milliseconds(250)) {
-    const bool settled = std::abs(light_scale - settle_reference_scale) <= 0.0025f * light_scale;
-    if (settled || now - settle_start_time >= std::chrono::seconds(10)) held_light_scale = light_scale;
-    settle_reference_scale = light_scale;
-    settle_reference_time = now;
+  measurement->issued = false;
+  if (measurement->level != exposure_level || total <= 0.0) return;
+  for (int i = 0; i < map_exposure::BINS; ++i) exposure_bins[i] += counts[i] / total;
+  exposure_frames += 1.0;
+  const auto frames = static_cast<int>(exposure_frames);
+  if (frames > 60 && frames % 15 != 0) return;
+  std::array<double, map_exposure::BINS> share = {};
+  for (int i = 0; i < map_exposure::BINS; ++i) share[i] = exposure_bins[i] / exposure_frames;
+  const double maximum = current_light_scale;
+  map_light_scale = static_cast<float>(map_exposure::Settle(share, histogram_reads_linear, original_algorithm, std::min(0.5, maximum), maximum));
+}
+
+void MeasureExposure(IDirect3DDevice9* device) {
+  if (!light_scale_used || untonemapped_texture == nullptr || current_light_scale <= 0.f) return;
+  auto& measurement = exposure_measurements[exposure_measurement_index];
+  if (measurement.issued) CollectExposureMeasurement(&measurement);
+  if (measurement.issued) return;
+  exposure_measurement_index = (exposure_measurement_index + 1) % EXPOSURE_FRAMES_IN_FLIGHT;
+
+  for (auto*& query : measurement.queries) {
+    if (query == nullptr) device->CreateQuery(D3DQUERYTYPE_OCCLUSION, &query);
+    if (query == nullptr) return;
   }
-  return held_light_scale > 0.f ? held_light_scale : light_scale;
+  D3DSURFACE_DESC scene_desc = {};
+  untonemapped_texture->GetLevelDesc(0, &scene_desc);
+  D3DSURFACE_DESC sample_desc = scene_desc;
+  sample_desc.Width = 240;
+  sample_desc.Height = 135;
+  exposure_sample_texture = MatchTexture(device, exposure_sample_texture, sample_desc);
+  sample_desc.Format = D3DFMT_A8R8G8B8;
+  exposure_count_texture = MatchTexture(device, exposure_count_texture, sample_desc);
+  if (exposure_sample_texture == nullptr || exposure_count_texture == nullptr) return;
+
+  IDirect3DSurface9* scene = nullptr;
+  IDirect3DSurface9* sample = nullptr;
+  IDirect3DSurface9* count = nullptr;
+  untonemapped_texture->GetSurfaceLevel(0, &scene);
+  exposure_sample_texture->GetSurfaceLevel(0, &sample);
+  exposure_count_texture->GetSurfaceLevel(0, &count);
+  const RECT region = {
+      static_cast<LONG>(scene_desc.Width * 0.05f), static_cast<LONG>(scene_desc.Height * 0.075f),
+      static_cast<LONG>(scene_desc.Width * 0.95f), static_cast<LONG>(scene_desc.Height * 0.925f)};
+  device->StretchRect(scene, &region, sample, nullptr, D3DTEXF_POINT);
+  {
+    IDirect3DBaseTexture9* inputs[] = {exposure_sample_texture};
+    FullscreenPass pass(device, PostShader(device, &exposure_measure_shader, __exposure_measure), inputs, count);
+    for (int i = 0; i < map_exposure::BINS; ++i) {
+      const float bin[4] = {
+          i == 0 ? -1.f : static_cast<float>(map_exposure::BinEdge(i)),
+          i == map_exposure::BINS - 1 ? 1e30f : static_cast<float>(map_exposure::BinEdge(i + 1)),
+          1.f / current_light_scale, 0.f};
+      measurement.queries[i]->Issue(D3DISSUE_BEGIN);
+      pass.Draw(bin);
+      measurement.queries[i]->Issue(D3DISSUE_END);
+    }
+  }
+  measurement.issued = true;
+  measurement.level = exposure_level;
+  for (auto* surface : {scene, sample, count}) {
+    if (surface != nullptr) surface->Release();
+  }
 }
 
 IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
@@ -271,11 +358,14 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   histogram_drawn = true;
   float light_scale[4] = {1.f, 1.f, 1.f, 1.f};
   device->GetPixelShaderConstantF(30, light_scale, 1);
-  if (light_scale[0] > 0.f) {
-    const float shown_scale = HeldLightScale(light_scale[0]);
-    shader_injection.scene_exposure = (shown_scale > 1.f ? shown_scale : 1.f) / light_scale[0];
+  current_light_scale = light_scale[0];
+  histogram_reads_linear = sampler0_srgb_at_bind != 0;
+  if (current_light_scale != 1.f) light_scale_used = true;
+  TrackLevelLoad(current_light_scale);
+  if (current_light_scale > 0.f) {
+    const float shown = (light_scale_used && map_light_scale > 0.f) ? std::min(map_light_scale, current_light_scale) : 1.f;
+    shader_injection.scene_exposure = shown / current_light_scale;
   }
-  shader_injection.linear_input = sampler0_srgb_at_bind != 0 ? 1.f : 2.f;
   if (texture == nullptr || texture->GetType() != D3DRTYPE_TEXTURE) return nullptr;
   auto* copy = static_cast<IDirect3DTexture9*>(texture);
   D3DSURFACE_DESC desc = {};
@@ -428,11 +518,18 @@ void OnVanillaEnginePostDrawn(reshade::api::command_list* cmd_list) {
 
 void OnDestroyDevice(reshade::api::device* device) {
   if (device->get_api() != reshade::api::device_api::d3d9) return;
-  for (auto** texture : {&untonemapped_texture, &graded_texture, &encoded_texture}) {
+  for (auto& measurement : exposure_measurements) {
+    for (auto*& query : measurement.queries) {
+      if (query != nullptr) query->Release();
+      query = nullptr;
+    }
+    measurement.issued = false;
+  }
+  for (auto** texture : {&untonemapped_texture, &graded_texture, &encoded_texture, &exposure_sample_texture, &exposure_count_texture}) {
     if (*texture != nullptr) (*texture)->Release();
     *texture = nullptr;
   }
-  for (auto** shader : {&encode_scene_shader, &post_upgrade_shader}) {
+  for (auto** shader : {&encode_scene_shader, &post_upgrade_shader, &exposure_measure_shader}) {
     if (*shader != nullptr) (*shader)->Release();
     *shader = nullptr;
   }
@@ -447,6 +544,7 @@ bool OnEnginePostReplace(reshade::api::command_list* cmd_list) {
 
 void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect* source_rect, const reshade::api::rect* dest_rect, uint32_t dirty_rect_count, const reshade::api::rect* dirty_rects) {
   if (queue->get_device()->get_api() != reshade::api::device_api::d3d9) return;
+  if (histogram_drawn) MeasureExposure(reinterpret_cast<IDirect3DDevice9*>(queue->get_device()->get_native()));
   shader_injection.scene_tone_mapped = engine_post_drawn ? 1.f : 0.f;
   engine_post_drawn = false;
   bloom_chain_drawn = false;
@@ -459,37 +557,13 @@ IDirect3DBaseTexture9* bloom_add_previous_texture = nullptr;
 const D3DSAMPLERSTATETYPE BLOOM_ADD_SAMPLER_STATES[] = {D3DSAMP_SRGBTEXTURE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER};
 DWORD bloom_add_previous_sampler_states[std::size(BLOOM_ADD_SAMPLER_STATES)] = {};
 
-void SetOriginalAlgorithmHold(float held_scale) {
-  const auto bucket_edge = [](int k) {
-    return -0.01 + std::exp(std::log(0.01) + (std::log(1.01) - std::log(0.01)) * k / 30.0);
-  };
-  const double mean = 0.15 / held_scale;
-  for (int k = 0; k < 29; ++k) {
-    const double low = (bucket_edge(k) + bucket_edge(k + 1)) * 0.5;
-    const double high = (bucket_edge(k + 1) + bucket_edge(k + 2)) * 0.5;
-    if (mean <= high || k == 28) {
-      shader_injection.histogram_hold_low = static_cast<float>(low);
-      shader_injection.histogram_hold_high = static_cast<float>(high);
-      shader_injection.histogram_hold_low_share = static_cast<float>(std::clamp((high - mean) / (high - low), 0.0, 1.0));
-      return;
-    }
-  }
-}
-
 bool OnLuminanceCompareReplace(reshade::api::command_list* cmd_list) {
   auto* native_device = GetNativeDevice(cmd_list);
   IDirect3DSurface9* source = CaptureSceneCopy(native_device);
   if (source != nullptr) source->Release();
   float bucket[4] = {};
   native_device->GetPixelShaderConstantF(0, bucket, 1);
-  static bool original_algorithm = false;
   if (bucket[0] == 0.f && bucket[1] < 50000.f) original_algorithm = bucket[1] < 0.01f;
-  if (original_algorithm) {
-    if (held_light_scale > 0.f) SetOriginalAlgorithmHold(held_light_scale);
-    shader_injection.histogram_mode = held_light_scale > 0.f ? 3.f : 0.f;
-  } else {
-    shader_injection.histogram_mode = held_light_scale > 0.f ? 1.f : 2.f;
-  }
   native_device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, TRUE);
   return true;
 }
