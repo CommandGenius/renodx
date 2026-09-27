@@ -397,16 +397,44 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
 }
 
 bool raw_scene_tone_mapped = false;
+bool perspective_drawn = false;
+
+bool IsScreenSpaceDraw(IDirect3DDevice9* device) {
+  float w_row[4] = {};
+  device->GetVertexShaderConstantF(11, w_row, 1);
+  return w_row[0] == 0.f && w_row[1] == 0.f && w_row[2] == 0.f;
+}
+
+bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
+  if (!perspective_drawn && cmd_list->get_device()->get_api() == reshade::api::device_api::d3d9) {
+    perspective_drawn = !IsScreenSpaceDraw(GetNativeDevice(cmd_list));
+  }
+  return false;
+}
+
+bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
+  return OnDraw(cmd_list, 0, 0, 0, 0);
+}
 
 bool OnUiDraw(reshade::api::command_list* cmd_list) {
-  if (!histogram_drawn || engine_post_drawn || bloom_chain_drawn || raw_scene_tone_mapped || untonemapped_texture == nullptr) return true;
-  raw_scene_tone_mapped = true;
+  if (engine_post_drawn || bloom_chain_drawn || raw_scene_tone_mapped) return true;
   auto* device = GetNativeDevice(cmd_list);
+  if (histogram_drawn ? untonemapped_texture == nullptr : !perspective_drawn || !IsScreenSpaceDraw(device)) return true;
+  raw_scene_tone_mapped = true;
   IDirect3DSurface9* target = nullptr;
   if (FAILED(device->GetRenderTarget(0, &target)) || target == nullptr) return true;
   D3DSURFACE_DESC desc = {};
   target->GetDesc(&desc);
-  if (desc.Format == D3DFMT_A16B16G16R16F) {
+  if (!histogram_drawn && desc.Format == D3DFMT_A16B16G16R16F) {
+    untonemapped_texture = MatchTexture(device, untonemapped_texture, desc);
+    IDirect3DSurface9* keep = nullptr;
+    if (untonemapped_texture != nullptr && SUCCEEDED(untonemapped_texture->GetSurfaceLevel(0, &keep))) {
+      device->StretchRect(target, nullptr, keep, nullptr, D3DTEXF_NONE);
+      keep->Release();
+    }
+    shader_injection.scene_exposure = 1.f;
+  }
+  if (desc.Format == D3DFMT_A16B16G16R16F && untonemapped_texture != nullptr) {
     const float params[4] = {0.f, 1.f, 0.f, 0.f};
     IDirect3DBaseTexture9* inputs[] = {untonemapped_texture, untonemapped_texture, untonemapped_texture};
     DrawFullscreen(device, PostShader(device, &post_upgrade_shader, __post_upgrade), inputs, target, params);
@@ -564,6 +592,7 @@ void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain*
   bloom_chain_drawn = false;
   histogram_drawn = false;
   raw_scene_tone_mapped = false;
+  perspective_drawn = false;
   scene_encoded = false;
 }
 
@@ -1247,6 +1276,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         }
 
         reshade::register_event<reshade::addon_event::present>(OnScenePresent);
+        reshade::register_event<reshade::addon_event::draw>(OnDraw);
+        reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
         reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         wchar_t executable_path[MAX_PATH] = {};
