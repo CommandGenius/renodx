@@ -1,0 +1,7 @@
+#define SPRITE_BRANCH 1
+#define VERTEXCOLOR 1
+#define CONSTANTCOLOR 1
+#define HDRTYPE 0
+#define HDRENABLED 0
+#define PIXELFOGTYPE 1
+#include "./sprite.hlsl"

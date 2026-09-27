@@ -82,7 +82,7 @@ struct ShaderInjectData {
 
   float custom_flip_uv_y;
   float srgb_write_off;
-  float scene_exposure;
+  float padding0;
   float linear_input;
 };
 
@@ -125,7 +125,6 @@ float4 shader_injection[9] : register(c210);
 #define RENODX_BLOOM_VALID                     shader_injection[7][3]
 #define RENODX_CUSTOM_FLIP_UV_Y                shader_injection[8][0]
 #define RENODX_SRGB_WRITE_OFF                  shader_injection[8][1]
-#define RENODX_SCENE_EXPOSURE                  shader_injection[8][2]
 #define RENODX_LINEAR_INPUT                    shader_injection[8][3]
 
 #define RENODX_RENO_DRT_TONE_MAP_METHOD renodx::tonemap::renodrt::config::tone_map_method::REINHARD
@@ -175,7 +174,6 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_BLOOM_VALID                     shader_injection.bloom_valid
 #define RENODX_CUSTOM_FLIP_UV_Y                shader_injection.custom_flip_uv_y
 #define RENODX_SRGB_WRITE_OFF                  shader_injection.srgb_write_off
-#define RENODX_SCENE_EXPOSURE                  shader_injection.scene_exposure
 #define RENODX_LINEAR_INPUT                    shader_injection.linear_input
 #define RENODX_RENO_DRT_TONE_MAP_METHOD        renodx::tonemap::renodrt::config::tone_map_method::REINHARD
 

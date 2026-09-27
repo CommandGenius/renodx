@@ -26,7 +26,7 @@
 
 namespace {
 
-ShaderInjectData shader_injection = {.scene_exposure = 1.f};
+ShaderInjectData shader_injection;
 
 bool engine_post_drawn = false;
 
@@ -235,9 +235,6 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   if (scene_copy_texture != nullptr) scene_copy_texture->Release();
   scene_copy_texture = texture;
   histogram_drawn = true;
-  float light_scale[4] = {1.f, 1.f, 1.f, 1.f};
-  device->GetPixelShaderConstantF(30, light_scale, 1);
-  shader_injection.scene_exposure = light_scale[0] > 0.f ? 1.f / light_scale[0] : 1.f;
   shader_injection.linear_input = sampler0_srgb_at_bind != 0 ? 1.f : 2.f;
   if (texture == nullptr || texture->GetType() != D3DRTYPE_TEXTURE) return nullptr;
   auto* copy = static_cast<IDirect3DTexture9*>(texture);
@@ -276,6 +273,22 @@ bool OnUiDraw(reshade::api::command_list* cmd_list) {
 }
 
 IDirect3DTexture9* encoded_texture = nullptr;
+bool scene_encoded = false;
+
+IDirect3DTexture9* EncodedScene(IDirect3DDevice9* device) {
+  if (scene_encoded) return encoded_texture;
+  scene_encoded = true;
+  D3DSURFACE_DESC desc = {};
+  untonemapped_texture->GetLevelDesc(0, &desc);
+  encoded_texture = MatchTexture(device, encoded_texture, desc);
+  IDirect3DSurface9* target = nullptr;
+  if (encoded_texture != nullptr && SUCCEEDED(encoded_texture->GetSurfaceLevel(0, &target))) {
+    IDirect3DBaseTexture9* inputs[] = {untonemapped_texture};
+    DrawFullscreen(device, PostShader(device, &encode_scene_shader, __encode_scene), inputs, target);
+    target->Release();
+  }
+  return encoded_texture;
+}
 IDirect3DBaseTexture9* previous_texture_slot[2] = {};
 
 bool BoundTextureIsSceneCopy(IDirect3DDevice9* device, DWORD slot) {
@@ -303,19 +316,11 @@ bool downsample_swapped = false;
 
 bool OnVanillaDownsampleDraw(reshade::api::command_list* cmd_list) {
   auto* device = GetNativeDevice(cmd_list);
-  downsample_swapped = untonemapped_texture != nullptr && histogram_drawn && BoundTextureIsSceneCopy(device, 0);
+  downsample_swapped = untonemapped_texture != nullptr && histogram_drawn && BoundTextureIsSceneCopy(device, 0)
+                       && EncodedScene(device) != nullptr;
   shader_injection.linear_input = (!downsample_swapped && untonemapped_texture != nullptr && histogram_drawn) ? 2.f : 0.f;
   if (!downsample_swapped) return true;
   bloom_chain_drawn = true;
-  D3DSURFACE_DESC desc = {};
-  untonemapped_texture->GetLevelDesc(0, &desc);
-  encoded_texture = MatchTexture(device, encoded_texture, desc);
-  IDirect3DSurface9* target = nullptr;
-  if (encoded_texture != nullptr && SUCCEEDED(encoded_texture->GetSurfaceLevel(0, &target))) {
-    IDirect3DBaseTexture9* inputs[] = {untonemapped_texture};
-    DrawFullscreen(device, PostShader(device, &encode_scene_shader, __encode_scene), inputs, target);
-    target->Release();
-  }
   SwapTextureSlot(device, 0, encoded_texture);
   return true;
 }
@@ -344,7 +349,8 @@ bool OnVanillaEnginePostDraw(reshade::api::command_list* cmd_list) {
   device->GetTexture(0, &bloom_texture);
   device->GetPixelShaderConstantF(5, bloom_factor, 1);
   bloom_factor_weight = 0.5f;
-  post_swapped = encoded_texture != nullptr && histogram_drawn && BoundTextureIsSceneCopy(device, 1);
+  post_swapped = untonemapped_texture != nullptr && histogram_drawn && BoundTextureIsSceneCopy(device, 1)
+                 && EncodedScene(device) != nullptr;
   if (post_swapped) SwapTextureSlot(device, 1, encoded_texture);
   return true;
 }
@@ -406,6 +412,7 @@ void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain*
   bloom_chain_drawn = false;
   histogram_drawn = false;
   raw_scene_tone_mapped = false;
+  scene_encoded = false;
 }
 
 IDirect3DBaseTexture9* bloom_add_previous_texture = nullptr;
@@ -503,9 +510,6 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x9D06155A),
     CustomShaderEntry(0xF990E8E5),
     CustomShaderEntry(0x9010CD7F),
-    PORTAL2_ENGINE_POST_ENTRIES,
-    L4D2_ENGINE_POST_ENTRIES,
-    BLACKMESA_ENGINE_POST_ENTRIES,
     {0x6236B99B, {.crc32 = 0x6236B99B, .on_draw = &OnUiDraw}},
     {0xCFAFE6F6, {.crc32 = 0xCFAFE6F6, .on_draw = &OnUiDraw}},
     {0x201ADBD3, {.crc32 = 0x201ADBD3, .on_draw = &OnUiDraw}},
@@ -539,6 +543,37 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0xB51EBBA2, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0xC640A8A5, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0xCF6CC274, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x1016E67B, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x119CBCD8, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x312EC476, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x3157AC53, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x4CC17B01, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x630A37BC, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x6A52A25B, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x6C513BEB, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xCFF674D2, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xD78AD20F, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xFC95BEB7, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xFEEE531F, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x0A5F8217, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x241E712F, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x439B3680, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x71A6DE00, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x9085F662, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xE7AEFC2F, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x264317C2, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x385CF8DA, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x3F6A24C7, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x67740C79, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x68D7064B, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x73F59BC3, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0x79E07AFC, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xBD7927FA, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xBFA43DA4, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xC1823A2C, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xE95B8DB9, &OnGammaSpaceDrawReplace),
+    CustomShaderEntryCallback(0xF024CD51, &OnGammaSpaceDrawReplace),
+    CustomShaderEntry(0x65FAE654),
     __ALL_CUSTOM_SHADERS,
 };
 
@@ -1073,6 +1108,17 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
   renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
   renodx::mods::swapchain::Use(fdw_reason, &shader_injection);
+  if (fdw_reason == DLL_PROCESS_ATTACH) {
+    const auto add_engine_post = [](std::span<const uint32_t> hashes, bool (*on_draw)(reshade::api::command_list*)) {
+      for (const auto hash : hashes) {
+        custom_shaders.try_emplace(hash, renodx::mods::shader::CustomShader{.crc32 = hash, .on_draw = on_draw, .on_drawn = &OnVanillaEnginePostDrawn});
+      }
+    };
+    add_engine_post(PORTAL2_ENGINE_POST_HASHES, &OnVanillaEnginePostDraw);
+    add_engine_post(L4D2_ENGINE_POST_HASHES, &OnVanillaEnginePostDrawFullBloom);
+    add_engine_post(BLACKMESA_ENGINE_POST_HASHES, &OnVanillaEnginePostDrawFullBloom);
+    add_engine_post(MAPBASE_ENGINE_POST_HASHES, &OnVanillaEnginePostDrawFullBloom);
+  }
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
 
   return TRUE;

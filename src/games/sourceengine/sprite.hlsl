@@ -1,5 +1,8 @@
 #include "./common.hlsl"
 
+#ifndef SPRITE_BRANCH
+#define SPRITE_BRANCH 0
+#endif
 #ifndef VERTEXCOLOR
 #define VERTEXCOLOR 0
 #endif
@@ -15,15 +18,20 @@
 #ifndef PIXELFOGTYPE
 #define PIXELFOGTYPE 0
 #endif
-
-static const float SPRITE_HDR_BOOST = 2.f;
+#ifndef FOG_2D
+#define FOG_2D 0
+#endif
 
 sampler2D TexSampler : register(s0);
 
 float4 g_Color               : register(c0);
 float4 g_HDRColorScale       : register(c1);
 float4 g_FogParams           : register(c12);
+#if (SPRITE_BRANCH == 0)
 float4 g_EyePos_SpecExponent : register(c20);
+#else
+float4 g_EyePos_SpecExponent : register(c11);
+#endif
 float4 g_LinearFogColor      : register(c29);
 float4 cLightScale           : register(c30);
 
@@ -39,7 +47,19 @@ float4 main(float2 uv : TEXCOORD0, float4 vertexColor : TEXCOORD2, float4 worldP
   sample.rgb *= g_HDRColorScale.x;
 #endif
 
-#if (PIXELFOGTYPE == 1)
+#if (SPRITE_BRANCH == 2)
+#if (PIXELFOGTYPE == 0)
+#if (FOG_2D == 1)
+  float fog_distance = distance(g_EyePos_SpecExponent.xy, worldPos_projPosZ.xy);
+#else
+  float fog_distance = distance(g_EyePos_SpecExponent.xyz, worldPos_projPosZ.xyz);
+#endif
+  float fog = min(saturate(fog_distance * g_FogParams.w + g_FogParams.x), g_FogParams.z);
+  fog *= fog;
+#else
+  float fog = 0.f;
+#endif
+#elif (PIXELFOGTYPE == 1)
   float depth_from_water = g_FogParams.y - worldPos_projPosZ.z;
   float depth_from_eye = g_EyePos_SpecExponent.z - worldPos_projPosZ.z;
   float fog = saturate(saturate(depth_from_water / depth_from_eye) * worldPos_projPosZ.w * g_FogParams.w);
@@ -52,6 +72,6 @@ float4 main(float2 uv : TEXCOORD0, float4 vertexColor : TEXCOORD2, float4 worldP
 #endif
 
   float3 result = lerp(sample.rgb * cLightScale.w, g_LinearFogColor.rgb, fog);
-  if (RENODX_SRGB_WRITE_OFF == 1.f) result = GammaSpaceOutput(result) * SPRITE_HDR_BOOST;
+  if (RENODX_SRGB_WRITE_OFF == 1.f) result = renodx::color::srgb::DecodeSafe(result);
   return float4(result, sample.a);
 }
