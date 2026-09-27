@@ -23,13 +23,15 @@ float3 FramebufferToGammaClamped(float3 fb_color) {
 }
 
 float3 ToneMapScene(float3 untonemapped, float3 graded_sdr, float3 neutral_sdr) {
+  untonemapped *= RENODX_SCENE_EXPOSURE;
   if (RENODX_TONE_MAP_TYPE == 0.f) {
-    return renodx::draw::RenderIntermediatePass(saturate(graded_sdr));
+    return renodx::draw::RenderIntermediatePass(saturate(graded_sdr * RENODX_SCENE_EXPOSURE));
   }
   return renodx::draw::RenderIntermediatePass(renodx::draw::ToneMapPass(untonemapped, graded_sdr, neutral_sdr));
 }
 
 float3 ToneMapScene(float3 untonemapped) {
+  untonemapped *= RENODX_SCENE_EXPOSURE;
   if (RENODX_TONE_MAP_TYPE == 0.f) {
     return renodx::draw::RenderIntermediatePass(saturate(untonemapped));
   }

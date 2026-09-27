@@ -26,7 +26,7 @@
 
 namespace {
 
-ShaderInjectData shader_injection;
+ShaderInjectData shader_injection = {.scene_exposure = 1.f};
 
 bool engine_post_drawn = false;
 
@@ -235,6 +235,9 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   if (scene_copy_texture != nullptr) scene_copy_texture->Release();
   scene_copy_texture = texture;
   histogram_drawn = true;
+  float light_scale[4] = {1.f, 1.f, 1.f, 1.f};
+  device->GetPixelShaderConstantF(30, light_scale, 1);
+  shader_injection.scene_exposure = (light_scale[0] > 0.f && light_scale[0] < 1.f) ? 1.f / light_scale[0] : 1.f;
   shader_injection.linear_input = sampler0_srgb_at_bind != 0 ? 1.f : 2.f;
   if (texture == nullptr || texture->GetType() != D3DRTYPE_TEXTURE) return nullptr;
   auto* copy = static_cast<IDirect3DTexture9*>(texture);
@@ -1094,8 +1097,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         reshade::register_event<reshade::addon_event::present>(OnScenePresent);
         reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
-        reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
-        reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+        wchar_t executable_path[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, executable_path, MAX_PATH);
+        const wchar_t* executable_name = wcsrchr(executable_path, L'\\');
+        if (_wcsicmp(executable_name != nullptr ? executable_name + 1 : executable_path, L"bms.exe") == 0) {
+          reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+          reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+        }
 
         initialized = true;
       }
