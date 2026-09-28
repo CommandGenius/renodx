@@ -399,15 +399,11 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
 bool raw_scene_tone_mapped = false;
 bool perspective_drawn = false;
 
-bool IsScreenSpaceDraw(IDirect3DDevice9* device) {
-  float w_row[4] = {};
-  device->GetVertexShaderConstantF(11, w_row, 1);
-  return w_row[0] == 0.f && w_row[1] == 0.f && w_row[2] == 0.f;
-}
-
 bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
   if (!perspective_drawn && cmd_list->get_device()->get_api() == reshade::api::device_api::d3d9) {
-    perspective_drawn = !IsScreenSpaceDraw(GetNativeDevice(cmd_list));
+    float w_row[4] = {};
+    GetNativeDevice(cmd_list)->GetVertexShaderConstantF(11, w_row, 1);
+    perspective_drawn = w_row[0] != 0.f || w_row[1] != 0.f || w_row[2] != 0.f;
   }
   return false;
 }
@@ -419,13 +415,25 @@ bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uin
 bool OnUiDraw(reshade::api::command_list* cmd_list) {
   if (engine_post_drawn || bloom_chain_drawn || raw_scene_tone_mapped) return true;
   auto* device = GetNativeDevice(cmd_list);
-  if (histogram_drawn ? untonemapped_texture == nullptr : !perspective_drawn || !IsScreenSpaceDraw(device)) return true;
-  raw_scene_tone_mapped = true;
+  if (histogram_drawn) {
+    if (untonemapped_texture == nullptr) return true;
+  } else {
+    float view_projection[4][4] = {};
+    device->GetVertexShaderConstantF(8, view_projection[0], 4);
+    const bool vgui = view_projection[3][0] == 0.f && view_projection[3][1] == 0.f && view_projection[3][2] == 0.f
+                      && std::abs(view_projection[0][0]) < 0.1f;
+    if (!perspective_drawn || !vgui) return true;
+  }
   IDirect3DSurface9* target = nullptr;
   if (FAILED(device->GetRenderTarget(0, &target)) || target == nullptr) return true;
   D3DSURFACE_DESC desc = {};
   target->GetDesc(&desc);
-  if (!histogram_drawn && desc.Format == D3DFMT_A16B16G16R16F) {
+  if (!histogram_drawn && desc.Format != D3DFMT_A16B16G16R16F) {
+    target->Release();
+    return true;
+  }
+  raw_scene_tone_mapped = true;
+  if (!histogram_drawn) {
     untonemapped_texture = MatchTexture(device, untonemapped_texture, desc);
     IDirect3DSurface9* keep = nullptr;
     if (untonemapped_texture != nullptr && SUCCEEDED(untonemapped_texture->GetSurfaceLevel(0, &keep))) {
