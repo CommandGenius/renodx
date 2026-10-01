@@ -71,7 +71,8 @@ float4 main(float2 uv : TEXCOORD0, float4 vertexColor : TEXCOORD2, float4 worldP
   fog *= fog;
 #endif
 
-  float3 result = lerp(sample.rgb * cLightScale.w, g_LinearFogColor.rgb, fog);
+  const float light_scale = RENODX_SCENE_POST_DRAWN == 1.f ? 1.f : cLightScale.w;
+  float3 result = lerp(sample.rgb * light_scale, g_LinearFogColor.rgb, fog);
   if (RENODX_SRGB_WRITE_OFF == 1.f) result = renodx::color::srgb::DecodeSafe(result);
   return float4(result, sample.a);
 }

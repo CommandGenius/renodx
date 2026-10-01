@@ -10,9 +10,9 @@ float4 params : register(c0);
 float3 Tap(float2 uv) {
   float3 tap = tex2D(TexSampler, uv).rgb;
 #if (LINEAR_INPUT == 1)
-  tap = renodx::color::srgb::Encode(saturate(tap));
+  tap = renodx::color::srgb::Encode(saturate(DisplayScene(tap)));
 #else
-  if (RENODX_LINEAR_INPUT == 2.f) tap = renodx::color::srgb::Encode(saturate(tap));
+  if (RENODX_LINEAR_INPUT == 2.f) tap = renodx::color::srgb::Encode(saturate(DisplayScene(tap)));
 #endif
   return tap;
 }

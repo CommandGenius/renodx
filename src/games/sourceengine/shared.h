@@ -84,12 +84,17 @@ struct ShaderInjectData {
   float srgb_write_off;
   float scene_exposure;
   float linear_input;
+
+  float scene_exposure_pad;
+  float bloom_strength;
+  float scene_post_drawn;
+  float scene_exposure_pad2;
 };
 
 #ifndef __cplusplus
 #if (__SHADER_TARGET_MAJOR == 3)
 
-float4 shader_injection[9] : register(c210);
+float4 shader_injection[10] : register(c210);
 
 #define RENODX_PEAK_WHITE_NITS               shader_injection[0][0]
 #define RENODX_DIFFUSE_WHITE_NITS            shader_injection[0][1]
@@ -123,6 +128,8 @@ float4 shader_injection[9] : register(c210);
 #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection[7][1]
 #define RENODX_SCENE_TONE_MAPPED               shader_injection[7][2]
 #define RENODX_BLOOM_VALID                     shader_injection[7][3]
+#define RENODX_BLOOM_STRENGTH                  shader_injection[9][1]
+#define RENODX_SCENE_POST_DRAWN                shader_injection[9][2]
 #define RENODX_CUSTOM_FLIP_UV_Y                shader_injection[8][0]
 #define RENODX_SRGB_WRITE_OFF                  shader_injection[8][1]
 #define RENODX_SCENE_EXPOSURE                  shader_injection[8][2]
@@ -173,6 +180,8 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection.swap_chain_encoding_color_space
 #define RENODX_SCENE_TONE_MAPPED               shader_injection.scene_tone_mapped
 #define RENODX_BLOOM_VALID                     shader_injection.bloom_valid
+#define RENODX_BLOOM_STRENGTH                  shader_injection.bloom_strength
+#define RENODX_SCENE_POST_DRAWN                shader_injection.scene_post_drawn
 #define RENODX_CUSTOM_FLIP_UV_Y                shader_injection.custom_flip_uv_y
 #define RENODX_SRGB_WRITE_OFF                  shader_injection.srgb_write_off
 #define RENODX_SCENE_EXPOSURE                  shader_injection.scene_exposure

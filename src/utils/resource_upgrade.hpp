@@ -3179,6 +3179,9 @@ inline void OnPushDescriptors(
 #endif
 
   bool changed = false;
+  auto* d3d9_device = cmd_list->get_device()->get_api() == reshade::api::device_api::d3d9
+                          ? reinterpret_cast<IDirect3DDevice9*>(static_cast<uintptr_t>(cmd_list->get_device()->get_native()))  // NOLINT(performance-no-int-to-ptr)
+                          : nullptr;
 
   switch (update.type) {
     case reshade::api::descriptor_type::sampler_with_resource_view: {
@@ -3189,6 +3192,12 @@ inline void OnPushDescriptors(
         if (resource_view.handle == 0) continue;
         auto clone = GetResourceViewClone(resource_view);
         if (clone.handle == 0) continue;
+        if (d3d9_device != nullptr) {
+          DWORD srgb_read = 0;
+          const DWORD sampler = update.binding + i + (stages == reshade::api::shader_stage::vertex ? D3DVERTEXTEXTURESAMPLER0 : 0u);
+          d3d9_device->GetSamplerState(sampler, D3DSAMP_SRGBTEXTURE, &srgb_read);
+          clone.handle = (clone.handle & ~1ull) | (srgb_read != 0u ? 1ull : 0ull);
+        }
 
 #ifdef DEBUG_LEVEL_1
         std::stringstream s;

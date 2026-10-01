@@ -13,9 +13,13 @@ float3 BoundHdr(float3 color) {
   return color;
 }
 
+float3 DisplayScene(float3 fb_color) {
+  return IsHdrPipeline() ? fb_color * RENODX_SCENE_EXPOSURE : fb_color;
+}
+
 float3 FramebufferToGamma(float3 fb_color) {
   if (!IsHdrPipeline()) return fb_color;
-  return renodx::color::srgb::Encode(BoundHdr(fb_color));
+  return renodx::color::srgb::Encode(BoundHdr(DisplayScene(fb_color)));
 }
 
 float3 FramebufferToGammaClamped(float3 fb_color) {
@@ -23,15 +27,13 @@ float3 FramebufferToGammaClamped(float3 fb_color) {
 }
 
 float3 ToneMapScene(float3 untonemapped, float3 graded_sdr, float3 neutral_sdr) {
-  untonemapped *= RENODX_SCENE_EXPOSURE;
   if (RENODX_TONE_MAP_TYPE == 0.f) {
-    return renodx::draw::RenderIntermediatePass(saturate(graded_sdr * RENODX_SCENE_EXPOSURE));
+    return renodx::draw::RenderIntermediatePass(saturate(graded_sdr));
   }
   return renodx::draw::RenderIntermediatePass(renodx::draw::ToneMapPass(untonemapped, graded_sdr, neutral_sdr));
 }
 
 float3 ToneMapScene(float3 untonemapped) {
-  untonemapped *= RENODX_SCENE_EXPOSURE;
   if (RENODX_TONE_MAP_TYPE == 0.f) {
     return renodx::draw::RenderIntermediatePass(saturate(untonemapped));
   }

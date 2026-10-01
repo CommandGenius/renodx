@@ -165,7 +165,7 @@ float4 main(float2 baseTexCoord : TEXCOORD0) : COLOR0 {
   outColor = PerformAA(outColor, fbTexCoord);
 #endif
 
-  float bloom_valid = IsHdrPipeline() ? RENODX_BLOOM_VALID : 1.f;
+  float bloom_valid = IsHdrPipeline() ? RENODX_BLOOM_VALID * RENODX_BLOOM_STRENGTH : 1.f;
   outColor += BloomFactor.x * tex2D(BaseTextureSampler, baseTexCoord).rgb * bloom_valid;
 
   if (!IsHdrPipeline()) {

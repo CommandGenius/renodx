@@ -21,19 +21,26 @@
 #include "../../mods/swapchain.hpp"
 #include "../../utils/directx.hpp"
 #include "../../utils/settings.hpp"
-#include "./map_exposure.hpp"
+#include "./eye_adaptation.hpp"
 #include "./portal2_hashes.hpp"
 #include "./shared.h"
 
 namespace {
 
-ShaderInjectData shader_injection = {.scene_exposure = 1.f};
+ShaderInjectData shader_injection = {.scene_exposure = 1.f, .bloom_strength = 0.25f};
 
 bool engine_post_drawn = false;
+
+void MarkPostDrawn() {
+  engine_post_drawn = true;
+  shader_injection.scene_post_drawn = 1.f;
+}
 
 bool bloom_chain_drawn = false;
 
 bool histogram_drawn = false;
+bool histogram_drawn_last_frame = false;
+bool perspective_drawn = false;
 
 bool OnBloomDownsampleReplace(reshade::api::command_list* cmd_list) {
   bloom_chain_drawn = true;
@@ -193,7 +200,6 @@ IDirect3DBaseTexture9* bloom_texture = nullptr;
 float bloom_factor[4] = {};
 IDirect3DPixelShader9* encode_scene_shader = nullptr;
 IDirect3DPixelShader9* post_upgrade_shader = nullptr;
-IDirect3DPixelShader9* exposure_measure_shader = nullptr;
 IDirect3DDevice9* post_shader_device = nullptr;
 
 IDirect3DTexture9* MatchTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture, const D3DSURFACE_DESC& desc) {
@@ -211,8 +217,7 @@ IDirect3DPixelShader9* PostShader(IDirect3DDevice9* device, IDirect3DPixelShader
   if (post_shader_device != device) {
     if (encode_scene_shader != nullptr) encode_scene_shader->Release();
     if (post_upgrade_shader != nullptr) post_upgrade_shader->Release();
-    if (exposure_measure_shader != nullptr) exposure_measure_shader->Release();
-    encode_scene_shader = post_upgrade_shader = exposure_measure_shader = nullptr;
+    encode_scene_shader = post_upgrade_shader = nullptr;
     post_shader_device = device;
   }
   if (*shader == nullptr) device->CreatePixelShader(reinterpret_cast<const DWORD*>(code.data()), shader);
@@ -294,126 +299,13 @@ void DrawFullscreen(IDirect3DDevice9* device, IDirect3DPixelShader9* shader, std
   FullscreenPass(device, shader, textures, target).Draw(constants_c0);
 }
 
-DWORD sampler0_srgb_at_bind = 0;
-bool histogram_reads_linear = false;
-bool original_algorithm = false;
 float current_light_scale = 1.f;
 bool light_scale_used = false;
 
-constexpr int EXPOSURE_FRAMES_IN_FLIGHT = 3;
-struct ExposureMeasurement {
-  IDirect3DQuery9* queries[map_exposure::BINS] = {};
-  bool issued = false;
-  uint32_t level = 0;
-};
-ExposureMeasurement exposure_measurements[EXPOSURE_FRAMES_IN_FLIGHT];
-int exposure_measurement_index = 0;
-IDirect3DTexture9* exposure_sample_texture = nullptr;
-IDirect3DTexture9* exposure_count_texture = nullptr;
-std::array<double, map_exposure::SETTLE_BINS> exposure_settles = {};
-double exposure_frames = 0.0;
-uint32_t exposure_level = 0;
-float map_light_scale = 0.f;
-float level_light_scale_max = 0.f;
+sourceengine::EyeAdaptation eye_adaptation;
 
-void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages, reshade::api::pipeline_layout layout, uint32_t layout_param, const reshade::api::descriptor_table_update& update) {
-  if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return;
-  if (update.type != reshade::api::descriptor_type::sampler_with_resource_view || update.binding != 0) return;
-  GetNativeDevice(cmd_list)->GetSamplerState(0, D3DSAMP_SRGBTEXTURE, &sampler0_srgb_at_bind);
-}
-
-void TrackLevelLoad(float light_scale) {
-  static auto previous_capture = std::chrono::steady_clock::time_point{};
-  static bool resumed = false;
-  const auto now = std::chrono::steady_clock::now();
-  resumed |= now - previous_capture > std::chrono::milliseconds(500);
-  previous_capture = now;
-  if (light_scale == 1.f) return;
-  if (resumed && light_scale < 0.97f * level_light_scale_max) {
-    exposure_settles = {};
-    exposure_frames = 0.0;
-    map_light_scale = 0.f;
-    level_light_scale_max = 0.f;
-    ++exposure_level;
-  }
-  resumed = false;
-  level_light_scale_max = std::max(level_light_scale_max, light_scale);
-}
-
-void CollectExposureMeasurement(ExposureMeasurement* measurement) {
-  DWORD counts[map_exposure::BINS] = {};
-  double total = 0.0;
-  for (int i = 0; i < map_exposure::BINS; ++i) {
-    if (measurement->queries[i] == nullptr || measurement->queries[i]->GetData(&counts[i], sizeof(DWORD), 0) != S_OK) return;
-    total += counts[i];
-  }
-  measurement->issued = false;
-  if (measurement->level != exposure_level || total <= 0.0) return;
-  std::array<double, map_exposure::BINS> share = {};
-  for (int i = 0; i < map_exposure::BINS; ++i) share[i] = counts[i] / total;
-  const double settled = map_exposure::Settle(share, histogram_reads_linear, original_algorithm, map_exposure::SETTLE_LOWEST, map_exposure::SETTLE_HIGHEST);
-  exposure_settles[map_exposure::SettleBin(settled)] += 1.0;
-  exposure_frames += 1.0;
-  const double maximum = level_light_scale_max > 0.f ? level_light_scale_max : 1.f;
-  map_light_scale = static_cast<float>(map_exposure::MeanSettle(exposure_settles, std::min(0.5, maximum), maximum));
-}
-
-void MeasureExposure(IDirect3DDevice9* device) {
-  if (!light_scale_used || untonemapped_texture == nullptr || current_light_scale <= 0.f) return;
-  if (current_light_scale == 1.f && level_light_scale_max > 0.f) return;
-  for (auto& pending : exposure_measurements) {
-    if (pending.issued) CollectExposureMeasurement(&pending);
-  }
-  static auto previous_issue = std::chrono::steady_clock::time_point{};
-  const auto now = std::chrono::steady_clock::now();
-  if (now - previous_issue < std::chrono::milliseconds(50)) return;
-  auto& measurement = exposure_measurements[exposure_measurement_index];
-  if (measurement.issued) return;
-  previous_issue = now;
-  exposure_measurement_index = (exposure_measurement_index + 1) % EXPOSURE_FRAMES_IN_FLIGHT;
-
-  for (auto*& query : measurement.queries) {
-    if (query == nullptr) device->CreateQuery(D3DQUERYTYPE_OCCLUSION, &query);
-    if (query == nullptr) return;
-  }
-  D3DSURFACE_DESC scene_desc = {};
-  untonemapped_texture->GetLevelDesc(0, &scene_desc);
-  D3DSURFACE_DESC sample_desc = scene_desc;
-  sample_desc.Width = 240;
-  sample_desc.Height = 135;
-  exposure_sample_texture = MatchTexture(device, exposure_sample_texture, sample_desc);
-  sample_desc.Format = D3DFMT_A8R8G8B8;
-  exposure_count_texture = MatchTexture(device, exposure_count_texture, sample_desc);
-  if (exposure_sample_texture == nullptr || exposure_count_texture == nullptr) return;
-
-  IDirect3DSurface9* scene = nullptr;
-  IDirect3DSurface9* sample = nullptr;
-  IDirect3DSurface9* count = nullptr;
-  untonemapped_texture->GetSurfaceLevel(0, &scene);
-  exposure_sample_texture->GetSurfaceLevel(0, &sample);
-  exposure_count_texture->GetSurfaceLevel(0, &count);
-  const RECT region = {
-      static_cast<LONG>(scene_desc.Width * 0.05f), static_cast<LONG>(scene_desc.Height * 0.075f),
-      static_cast<LONG>(scene_desc.Width * 0.95f), static_cast<LONG>(scene_desc.Height * 0.925f)};
-  device->StretchRect(scene, &region, sample, nullptr, D3DTEXF_POINT);
-  {
-    IDirect3DBaseTexture9* inputs[] = {exposure_sample_texture};
-    FullscreenPass pass(device, PostShader(device, &exposure_measure_shader, __exposure_measure), inputs, count);
-    for (int i = 0; i < map_exposure::BINS; ++i) {
-      const float bin[4] = {
-          i == 0 ? -1.f : static_cast<float>(map_exposure::BinEdge(i)),
-          i == map_exposure::BINS - 1 ? 1e30f : static_cast<float>(map_exposure::BinEdge(i + 1)),
-          1.f / current_light_scale, 0.f};
-      measurement.queries[i]->Issue(D3DISSUE_BEGIN);
-      pass.Draw(bin);
-      measurement.queries[i]->Issue(D3DISSUE_END);
-    }
-  }
-  measurement.issued = true;
-  measurement.level = exposure_level;
-  for (auto* surface : {scene, sample, count}) {
-    if (surface != nullptr) surface->Release();
-  }
+float SceneExposureFor(float light_scale) {
+  return light_scale > 0.f ? eye_adaptation.exposure / light_scale : eye_adaptation.exposure;
 }
 
 IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
@@ -422,16 +314,8 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   if (scene_copy_texture != nullptr) scene_copy_texture->Release();
   scene_copy_texture = texture;
   histogram_drawn = true;
-  float light_scale[4] = {1.f, 1.f, 1.f, 1.f};
-  device->GetPixelShaderConstantF(30, light_scale, 1);
-  current_light_scale = light_scale[0];
-  histogram_reads_linear = sampler0_srgb_at_bind != 0;
   if (current_light_scale != 1.f) light_scale_used = true;
-  TrackLevelLoad(current_light_scale);
-  if (current_light_scale > 0.f) {
-    const float shown = (light_scale_used && map_light_scale > 0.f) ? map_light_scale : 1.f;
-    shader_injection.scene_exposure = shown / current_light_scale;
-  }
+  shader_injection.scene_exposure = SceneExposureFor(current_light_scale);
   if (texture == nullptr || texture->GetType() != D3DRTYPE_TEXTURE) return nullptr;
   auto* copy = static_cast<IDirect3DTexture9*>(texture);
   D3DSURFACE_DESC desc = {};
@@ -445,23 +329,29 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   untonemapped_texture->GetSurfaceLevel(0, &keep);
   device->StretchRect(source, nullptr, keep, nullptr, D3DTEXF_NONE);
   keep->Release();
+  eye_adaptation.Update(device, untonemapped_texture, current_light_scale);
   return source;
 }
 
 bool raw_scene_tone_mapped = false;
-bool perspective_drawn = false;
 
-bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
-  if (!perspective_drawn && cmd_list->get_device()->get_api() == reshade::api::device_api::d3d9) {
-    float w_row[4] = {};
-    GetNativeDevice(cmd_list)->GetVertexShaderConstantF(11, w_row, 1);
-    perspective_drawn = w_row[0] != 0.f || w_row[1] != 0.f || w_row[2] != 0.f;
+void TonemapRawScene(IDirect3DDevice9* device, IDirect3DSurface9* target, const D3DSURFACE_DESC& desc) {
+  raw_scene_tone_mapped = true;
+  if (!histogram_drawn) {
+    untonemapped_texture = MatchTexture(device, untonemapped_texture, desc);
+    IDirect3DSurface9* keep = nullptr;
+    if (untonemapped_texture != nullptr && SUCCEEDED(untonemapped_texture->GetSurfaceLevel(0, &keep))) {
+      device->StretchRect(target, nullptr, keep, nullptr, D3DTEXF_NONE);
+      keep->Release();
+    }
+    shader_injection.scene_exposure = SceneExposureFor(current_light_scale);
   }
-  return false;
-}
-
-bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
-  return OnDraw(cmd_list, 0, 0, 0, 0);
+  if (desc.Format == D3DFMT_A16B16G16R16F && untonemapped_texture != nullptr) {
+    const float params[4] = {0.f, 1.f, 0.f, 0.f};
+    IDirect3DBaseTexture9* inputs[] = {untonemapped_texture, untonemapped_texture, untonemapped_texture};
+    DrawFullscreen(device, PostShader(device, &post_upgrade_shader, __post_upgrade), inputs, target, params);
+    MarkPostDrawn();
+  }
 }
 
 bool OnUiDraw(reshade::api::command_list* cmd_list) {
@@ -474,32 +364,13 @@ bool OnUiDraw(reshade::api::command_list* cmd_list) {
     device->GetVertexShaderConstantF(8, view_projection[0], 4);
     const bool vgui = view_projection[3][0] == 0.f && view_projection[3][1] == 0.f && view_projection[3][2] == 0.f
                       && std::abs(view_projection[0][0]) < 0.1f;
-    if (!perspective_drawn || !vgui) return true;
+    if (!perspective_drawn || !vgui || histogram_drawn_last_frame) return true;
   }
   IDirect3DSurface9* target = nullptr;
   if (FAILED(CurrentRenderTarget(device, &target)) || target == nullptr) return true;
   D3DSURFACE_DESC desc = {};
   target->GetDesc(&desc);
-  if (!histogram_drawn && desc.Format != D3DFMT_A16B16G16R16F) {
-    target->Release();
-    return true;
-  }
-  raw_scene_tone_mapped = true;
-  if (!histogram_drawn) {
-    untonemapped_texture = MatchTexture(device, untonemapped_texture, desc);
-    IDirect3DSurface9* keep = nullptr;
-    if (untonemapped_texture != nullptr && SUCCEEDED(untonemapped_texture->GetSurfaceLevel(0, &keep))) {
-      device->StretchRect(target, nullptr, keep, nullptr, D3DTEXF_NONE);
-      keep->Release();
-    }
-    shader_injection.scene_exposure = 1.f;
-  }
-  if (desc.Format == D3DFMT_A16B16G16R16F && untonemapped_texture != nullptr) {
-    const float params[4] = {0.f, 1.f, 0.f, 0.f};
-    IDirect3DBaseTexture9* inputs[] = {untonemapped_texture, untonemapped_texture, untonemapped_texture};
-    DrawFullscreen(device, PostShader(device, &post_upgrade_shader, __post_upgrade), inputs, target, params);
-    engine_post_drawn = true;
-  }
+  if (histogram_drawn || desc.Format == D3DFMT_A16B16G16R16F) TonemapRawScene(device, target, desc);
   target->Release();
   return true;
 }
@@ -612,10 +483,100 @@ void OnVanillaEnginePostDrawn(reshade::api::command_list* cmd_list) {
       const float factor[4] = {bloom_factor[0] * bloom_factor_weight, 0.f, 0.f, 0.f};
       IDirect3DBaseTexture9* inputs[] = {graded_texture, untonemapped_texture, bloom_texture};
       DrawFullscreen(device, PostShader(device, &post_upgrade_shader, __post_upgrade), inputs, target, factor);
-      engine_post_drawn = true;
+      MarkPostDrawn();
     }
   }
   target->Release();
+}
+
+extern renodx::mods::shader::CustomShaders custom_shaders;
+
+reshade::api::resource_view pending_scene_target = {0u};
+
+void OnBindRenderTargets(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::resource_view* rtvs, reshade::api::resource_view) {
+  pending_scene_target = {0u};
+  if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9 || count == 0 || rtvs[0].handle == 0u) return;
+  renodx::utils::resource::GetResourceViewInfo(rtvs[0], [&](const renodx::utils::resource::ResourceViewInfo& info) {
+    if (!info.is_clone && !info.clone_enabled && info.clone_target != nullptr && info.clone_target->use_resource_view_hot_swap) {
+      pending_scene_target = rtvs[0];
+    }
+  });
+}
+
+void ActivateSceneTarget(reshade::api::command_list* cmd_list, IDirect3DDevice9* device, bool perspective) {
+  const auto target = pending_scene_target;
+  pending_scene_target = {0u};
+  IDirect3DSurface9* depth = nullptr;
+  device->GetDepthStencilSurface(&depth);
+  if (depth == nullptr) return;
+  if (!perspective || !renodx::mods::swapchain::ActivateCloneHotSwap(cmd_list->get_device(), target)) {
+    depth->Release();
+    return;
+  }
+  const auto clone = renodx::utils::resource::upgrade::GetResourceViewClone(target);
+  if (clone.handle != 0u) {
+    D3DVIEWPORT9 viewport = {};
+    RECT scissor = {};
+    device->GetViewport(&viewport);
+    device->GetScissorRect(&scissor);
+    device->StretchRect(reinterpret_cast<IDirect3DSurface9*>(target.handle & ~1ull), nullptr, reinterpret_cast<IDirect3DSurface9*>(clone.handle & ~1ull), nullptr, D3DTEXF_NONE);
+    cmd_list->bind_render_targets_and_depth_stencil(1, &clone, {reinterpret_cast<uint64_t>(depth)});
+    device->SetViewport(&viewport);
+    device->SetScissorRect(&scissor);
+  }
+  depth->Release();
+}
+
+template <typename F>
+bool OnGenericDraw(reshade::api::command_list* cmd_list, F&& draw) {
+  if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return false;
+  auto* device = GetNativeDevice(cmd_list);
+  if (!perspective_drawn || pending_scene_target.handle != 0u) {
+    float w_row[4] = {};
+    device->GetVertexShaderConstantF(11, w_row, 1);
+    const bool perspective = w_row[0] != 0.f || w_row[1] != 0.f || w_row[2] != 0.f;
+    perspective_drawn |= perspective;
+    if (pending_scene_target.handle != 0u) ActivateSceneTarget(cmd_list, device, perspective);
+  }
+  if (perspective_drawn && !histogram_drawn) {
+    float light_scale[4] = {1.f, 1.f, 1.f, 1.f};
+    device->GetPixelShaderConstantF(30, light_scale, 1);
+    if (light_scale[0] > 0.f) current_light_scale = light_scale[0];
+  }
+  if (!histogram_drawn || engine_post_drawn || untonemapped_texture == nullptr) return false;
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (shader_state != nullptr && custom_shaders.contains(renodx::utils::shader::GetCurrentPixelShaderHash(shader_state))) return false;
+  const bool reads_scene_at_s1 = BoundTextureIsSceneCopy(device, 1);
+  const bool reads_scene_at_s0 = !reads_scene_at_s1 && !bloom_chain_drawn && BoundTextureIsSceneCopy(device, 0);
+  if (!reads_scene_at_s0 && !reads_scene_at_s1) return false;
+  IDirect3DSurface9* target = nullptr;
+  if (FAILED(CurrentRenderTarget(device, &target)) || target == nullptr) return false;
+  D3DSURFACE_DESC desc = {};
+  target->GetDesc(&desc);
+  target->Release();
+  D3DSURFACE_DESC scene_desc = {};
+  untonemapped_texture->GetLevelDesc(0, &scene_desc);
+  if (reads_scene_at_s0 && desc.Width < scene_desc.Width) {
+    OnVanillaDownsampleDraw(cmd_list);
+    draw();
+    OnVanillaDownsampleDrawn(cmd_list);
+    return true;
+  }
+  if (reads_scene_at_s1 && desc.Width == scene_desc.Width && desc.Height == scene_desc.Height && desc.Format == D3DFMT_A16B16G16R16F) {
+    OnVanillaEnginePostDrawFullBloom(cmd_list);
+    draw();
+    OnVanillaEnginePostDrawn(cmd_list);
+    return true;
+  }
+  return false;
+}
+
+bool OnDraw(reshade::api::command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance) {
+  return OnGenericDraw(cmd_list, [&] { cmd_list->draw(vertex_count, instance_count, first_vertex, first_instance); });
+}
+
+bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
+  return OnGenericDraw(cmd_list, [&] { cmd_list->draw_indexed(index_count, instance_count, first_index, vertex_offset, first_instance); });
 }
 
 IDirect3DTexture9* readback_texture = nullptr;
@@ -624,27 +585,21 @@ IDirect3DTexture9* readback_scene_texture = nullptr;
 
 void OnDestroyDevice(reshade::api::device* device) {
   if (device->get_api() != reshade::api::device_api::d3d9) return;
-  for (auto& measurement : exposure_measurements) {
-    for (auto*& query : measurement.queries) {
-      if (query != nullptr) query->Release();
-      query = nullptr;
-    }
-    measurement.issued = false;
-  }
-  for (auto** texture : {&untonemapped_texture, &graded_texture, &encoded_texture, &exposure_sample_texture, &exposure_count_texture, &readback_texture, &readback_scene_texture, &scene_resolve_texture}) {
+  for (auto** texture : {&untonemapped_texture, &graded_texture, &encoded_texture, &readback_texture, &readback_scene_texture, &scene_resolve_texture}) {
     if (*texture != nullptr) (*texture)->Release();
     *texture = nullptr;
   }
-  for (auto** shader : {&encode_scene_shader, &post_upgrade_shader, &exposure_measure_shader}) {
+  for (auto** shader : {&encode_scene_shader, &post_upgrade_shader}) {
     if (*shader != nullptr) (*shader)->Release();
     *shader = nullptr;
   }
+  eye_adaptation.Release();
   post_shader_device = nullptr;
 }
 
 bool OnEnginePostReplace(reshade::api::command_list* cmd_list) {
   shader_injection.bloom_valid = bloom_chain_drawn ? 1.f : 0.f;
-  engine_post_drawn = true;
+  MarkPostDrawn();
   return true;
 }
 
@@ -711,8 +666,14 @@ bool CopyFromSwapChain(reshade::api::command_list* cmd_list, reshade::api::resou
     }
   }
 
-  uint64_t dest_clone = 0;
-  renodx::utils::resource::GetResourceInfo(dest, [&dest_clone](const renodx::utils::resource::ResourceInfo& info) { dest_clone = info.clone.handle; });
+  IDirect3DSurface9* dest_level = SurfaceOf(dest.handle, dest_subresource);
+  if (dest_level == nullptr) {
+    scene_surface->Release();
+    return false;
+  }
+  renodx::mods::swapchain::ActivateCloneHotSwap(cmd_list->get_device(), {reinterpret_cast<uint64_t>(dest_level)});
+  dest_level->Release();
+  const uint64_t dest_clone = renodx::utils::resource::upgrade::GetResourceClone(dest).handle;
   IDirect3DSurface9* dest_surface = SurfaceOf(dest_clone != 0u ? dest_clone : dest.handle, dest_subresource);
   if (dest_surface == nullptr) {
     scene_surface->Release();
@@ -782,10 +743,21 @@ bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::
 
 void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect* source_rect, const reshade::api::rect* dest_rect, uint32_t dirty_rect_count, const reshade::api::rect* dirty_rects) {
   if (queue->get_device()->get_api() != reshade::api::device_api::d3d9) return;
-  if (histogram_drawn) MeasureExposure(reinterpret_cast<IDirect3DDevice9*>(queue->get_device()->get_native()));
+  auto* device = reinterpret_cast<IDirect3DDevice9*>(queue->get_device()->get_native());
+  if (!histogram_drawn && histogram_drawn_last_frame && light_scale_used && !engine_post_drawn && !raw_scene_tone_mapped && perspective_drawn) {
+    IDirect3DSurface9* target = nullptr;
+    if (SUCCEEDED(CurrentRenderTarget(device, &target)) && target != nullptr) {
+      D3DSURFACE_DESC desc = {};
+      target->GetDesc(&desc);
+      if (desc.Format == D3DFMT_A16B16G16R16F) TonemapRawScene(device, target, desc);
+      target->Release();
+    }
+  }
   shader_injection.scene_tone_mapped = engine_post_drawn ? 1.f : 0.f;
   engine_post_drawn = false;
+  shader_injection.scene_post_drawn = 0.f;
   bloom_chain_drawn = false;
+  histogram_drawn_last_frame = histogram_drawn;
   histogram_drawn = false;
   raw_scene_tone_mapped = false;
   perspective_drawn = false;
@@ -800,10 +772,6 @@ bool OnLuminanceCompareReplace(reshade::api::command_list* cmd_list) {
   auto* native_device = GetNativeDevice(cmd_list);
   IDirect3DSurface9* source = CaptureSceneCopy(native_device);
   if (source != nullptr) source->Release();
-  float bucket[4] = {};
-  native_device->GetPixelShaderConstantF(0, bucket, 1);
-  if (bucket[0] == 0.f && bucket[1] < 50000.f) original_algorithm = bucket[1] < 0.01f;
-  native_device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, TRUE);
   return true;
 }
 
@@ -827,7 +795,7 @@ bool OnBloomAddReplace(reshade::api::command_list* cmd_list) {
   native_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 
   shader_injection.bloom_valid = bloom_chain_drawn ? 1.f : 0.f;
-  engine_post_drawn = true;
+  MarkPostDrawn();
   return true;
 }
 
@@ -1470,13 +1438,23 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
             reshade::log::message(reshade::log::level::info, s.str().c_str());
           }
         }
+        for (const auto format : {reshade::api::format::b8g8r8a8_unorm, reshade::api::format::b8g8r8x8_unorm}) {
+          renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
+              .old_format = format,
+              .new_format = reshade::api::format::r16g16b16a16_float,
+              .use_resource_view_cloning = true,
+              .use_resource_view_hot_swap = true,
+              .dimensions = {.width = 1024, .height = 1024},
+              .usage_include = reshade::api::resource_usage::render_target,
+          });
+        }
 
         reshade::register_event<reshade::addon_event::present>(OnScenePresent);
+        reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
         reshade::register_event<reshade::addon_event::draw>(OnDraw);
         reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
         reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
         reshade::register_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
-        reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         wchar_t executable_path[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, executable_path, MAX_PATH);
@@ -1507,6 +1485,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     add_engine_post(L4D2_ENGINE_POST_HASHES, &OnVanillaEnginePostDrawFullBloom);
     add_engine_post(BLACKMESA_ENGINE_POST_HASHES, &OnVanillaEnginePostDrawFullBloom);
     add_engine_post(MAPBASE_ENGINE_POST_HASHES, &OnVanillaEnginePostDrawFullBloom);
+    add_engine_post(HL2_ENGINE_POST_HASHES, &OnVanillaEnginePostDrawFullBloom);
   }
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
 
