@@ -116,14 +116,66 @@ HRESULT STDMETHODCALLTYPE OnCreateTexture(
   return original_create_texture(device, width, height, levels, usage, format, pool, texture, shared_handle);
 }
 
+using GetRenderTargetFunction = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, IDirect3DSurface9**);
+GetRenderTargetFunction original_get_render_target = nullptr;
+bool hook_create_texture = false;
+
+HRESULT CurrentRenderTarget(IDirect3DDevice9* device, IDirect3DSurface9** target) {
+  return original_get_render_target != nullptr ? original_get_render_target(device, 0, target) : device->GetRenderTarget(0, target);
+}
+
+HRESULT STDMETHODCALLTYPE OnGetRenderTarget(IDirect3DDevice9* device, DWORD index, IDirect3DSurface9** target) {
+  const HRESULT hr = original_get_render_target(device, index, target);
+  if (FAILED(hr) || index != 0 || *target == nullptr) return hr;
+  static IDirect3DSurface9* clone_surface = nullptr;
+  static uint64_t clone_handle = 0;
+  static IDirect3DSurface9* original_surface = nullptr;
+  static IDirect3DSurface9* other_surface = nullptr;
+  if (*target == other_surface) return hr;
+  bool valid = false;
+  if (*target == clone_surface) {
+    renodx::utils::resource::GetResourceInfo({reinterpret_cast<uint64_t>(original_surface)}, [&](const renodx::utils::resource::ResourceInfo& info) {
+      valid = info.is_swap_chain && !info.destroyed && info.clone.handle == clone_handle;
+    });
+  }
+  if (!valid) {
+    clone_surface = nullptr;
+    clone_handle = 0;
+    original_surface = nullptr;
+    renodx::utils::resource::ForEachResourceInfo([&](const renodx::utils::resource::ResourceInfo& info) {
+      if (!info.is_swap_chain || info.destroyed || info.clone.handle == 0u) return;
+      auto* clone = reinterpret_cast<IDirect3DResource9*>(info.clone.handle);
+      IDirect3DSurface9* surface = clone->GetType() == D3DRTYPE_SURFACE ? static_cast<IDirect3DSurface9*>(clone) : nullptr;
+      if (clone->GetType() == D3DRTYPE_TEXTURE && SUCCEEDED(static_cast<IDirect3DTexture9*>(clone)->GetSurfaceLevel(0, &surface))) surface->Release();
+      if (surface == nullptr || surface != *target) return;
+      clone_surface = surface;
+      clone_handle = info.clone.handle;
+      original_surface = reinterpret_cast<IDirect3DSurface9*>(info.resource.handle);
+    });
+    if (original_surface == nullptr) {
+      other_surface = *target;
+      return hr;
+    }
+  }
+  (*target)->Release();
+  *target = original_surface;
+  original_surface->AddRef();
+  return hr;
+}
+
 void OnInitDevice(reshade::api::device* device) {
-  if (device->get_api() != reshade::api::device_api::d3d9 || original_create_texture != nullptr) return;
+  if (device->get_api() != reshade::api::device_api::d3d9) return;
   void** vtable = *reinterpret_cast<void***>(device->get_native());
-  DWORD protect = 0;
-  if (!VirtualProtect(&vtable[23], sizeof(void*), PAGE_READWRITE, &protect)) return;
-  original_create_texture = reinterpret_cast<CreateTextureFunction>(vtable[23]);
-  vtable[23] = reinterpret_cast<void*>(&OnCreateTexture);
-  VirtualProtect(&vtable[23], sizeof(void*), protect, &protect);
+  const auto patch = [vtable](size_t slot, void** original, void* hook) {
+    if (*original != nullptr) return;
+    DWORD protect = 0;
+    if (!VirtualProtect(&vtable[slot], sizeof(void*), PAGE_READWRITE, &protect)) return;
+    *original = vtable[slot];
+    vtable[slot] = hook;
+    VirtualProtect(&vtable[slot], sizeof(void*), protect, &protect);
+  };
+  if (hook_create_texture) patch(23, reinterpret_cast<void**>(&original_create_texture), reinterpret_cast<void*>(&OnCreateTexture));
+  patch(38, reinterpret_cast<void**>(&original_get_render_target), reinterpret_cast<void*>(&OnGetRenderTarget));
 }
 
 void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource) {
@@ -174,7 +226,7 @@ class FullscreenPass {
     if (shader == nullptr || target == nullptr || FAILED(device->CreateStateBlock(D3DSBT_ALL, &state_))) return;
     D3DSURFACE_DESC target_desc = {};
     target->GetDesc(&target_desc);
-    device->GetRenderTarget(0, &previous_target_);
+    CurrentRenderTarget(device, &previous_target_);
     device->GetDepthStencilSurface(&previous_depth_);
 
     device->SetRenderTarget(0, target);
@@ -425,7 +477,7 @@ bool OnUiDraw(reshade::api::command_list* cmd_list) {
     if (!perspective_drawn || !vgui) return true;
   }
   IDirect3DSurface9* target = nullptr;
-  if (FAILED(device->GetRenderTarget(0, &target)) || target == nullptr) return true;
+  if (FAILED(CurrentRenderTarget(device, &target)) || target == nullptr) return true;
   D3DSURFACE_DESC desc = {};
   target->GetDesc(&desc);
   if (!histogram_drawn && desc.Format != D3DFMT_A16B16G16R16F) {
@@ -547,7 +599,7 @@ void OnVanillaEnginePostDrawn(reshade::api::command_list* cmd_list) {
   if (post_swapped) RestoreTextureSlot(device, 1);
   post_swapped = false;
   IDirect3DSurface9* target = nullptr;
-  if (FAILED(device->GetRenderTarget(0, &target)) || target == nullptr) return;
+  if (FAILED(CurrentRenderTarget(device, &target)) || target == nullptr) return;
   D3DSURFACE_DESC desc = {};
   target->GetDesc(&desc);
   if (desc.Format == D3DFMT_A16B16G16R16F) {
@@ -566,6 +618,10 @@ void OnVanillaEnginePostDrawn(reshade::api::command_list* cmd_list) {
   target->Release();
 }
 
+IDirect3DTexture9* readback_texture = nullptr;
+IDirect3DTexture9* scene_resolve_texture = nullptr;
+IDirect3DTexture9* readback_scene_texture = nullptr;
+
 void OnDestroyDevice(reshade::api::device* device) {
   if (device->get_api() != reshade::api::device_api::d3d9) return;
   for (auto& measurement : exposure_measurements) {
@@ -575,7 +631,7 @@ void OnDestroyDevice(reshade::api::device* device) {
     }
     measurement.issued = false;
   }
-  for (auto** texture : {&untonemapped_texture, &graded_texture, &encoded_texture, &exposure_sample_texture, &exposure_count_texture}) {
+  for (auto** texture : {&untonemapped_texture, &graded_texture, &encoded_texture, &exposure_sample_texture, &exposure_count_texture, &readback_texture, &readback_scene_texture, &scene_resolve_texture}) {
     if (*texture != nullptr) (*texture)->Release();
     *texture = nullptr;
   }
@@ -590,6 +646,138 @@ bool OnEnginePostReplace(reshade::api::command_list* cmd_list) {
   shader_injection.bloom_valid = bloom_chain_drawn ? 1.f : 0.f;
   engine_post_drawn = true;
   return true;
+}
+
+bool IsThumbnailTarget(const D3DSURFACE_DESC& desc) {
+  return desc.Pool == D3DPOOL_DEFAULT && (desc.Usage & D3DUSAGE_RENDERTARGET) != 0 && desc.Width <= 512 && desc.Height <= 512;
+}
+
+IDirect3DSurface9* SurfaceOf(uint64_t handle, uint32_t subresource) {
+  auto* resource = reinterpret_cast<IDirect3DResource9*>(handle);
+  IDirect3DSurface9* surface = nullptr;
+  if (resource == nullptr) return nullptr;
+  if (resource->GetType() == D3DRTYPE_TEXTURE) {
+    static_cast<IDirect3DTexture9*>(resource)->GetSurfaceLevel(subresource, &surface);
+  } else if (resource->GetType() == D3DRTYPE_SURFACE) {
+    surface = static_cast<IDirect3DSurface9*>(resource);
+    surface->AddRef();
+  }
+  return surface;
+}
+
+bool OnReadback(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, IDirect3DSurface9* dest_surface, const D3DSURFACE_DESC& desc) {
+  uint64_t clone = 0;
+  renodx::utils::resource::GetResourceInfo(source, [&clone](const renodx::utils::resource::ResourceInfo& info) { clone = info.clone.handle; });
+  auto* clone_resource = reinterpret_cast<IDirect3DResource9*>(clone);
+  if (clone_resource == nullptr || clone_resource->GetType() != D3DRTYPE_TEXTURE || (desc.Format != D3DFMT_A8R8G8B8 && desc.Format != D3DFMT_X8R8G8B8)) return false;
+  auto* device = GetNativeDevice(cmd_list);
+  readback_texture = MatchTexture(device, readback_texture, desc);
+  IDirect3DSurface9* encoded = nullptr;
+  if (readback_texture == nullptr || FAILED(readback_texture->GetSurfaceLevel(0, &encoded))) return false;
+  IDirect3DBaseTexture9* inputs[] = {static_cast<IDirect3DTexture9*>(clone_resource)};
+  DrawFullscreen(device, PostShader(device, &encode_scene_shader, __encode_scene), inputs, encoded);
+  const HRESULT hr = device->GetRenderTargetData(encoded, dest_surface);
+  encoded->Release();
+  std::stringstream log;
+  log << "sourceengine: readback of clone subresource " << source_subresource << " to format " << desc.Format << " " << desc.Width << "x" << desc.Height << " hr " << std::hex << static_cast<uint32_t>(hr);
+  reshade::log::message(reshade::log::level::info, log.str().c_str());
+  return SUCCEEDED(hr);
+}
+
+bool CopyFromSwapChain(reshade::api::command_list* cmd_list, reshade::api::resource source, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box* dest_box, reshade::api::filter_mode filter) {
+  uint64_t scene_handle = 0;
+  renodx::utils::resource::GetResourceInfo(source, [&scene_handle](const renodx::utils::resource::ResourceInfo& info) {
+    if (info.is_swap_chain) scene_handle = info.clone.handle;
+  });
+  IDirect3DSurface9* scene_surface = SurfaceOf(scene_handle, 0);
+  if (scene_surface == nullptr) return false;
+  auto* device = GetNativeDevice(cmd_list);
+  D3DSURFACE_DESC scene_desc = {};
+  scene_surface->GetDesc(&scene_desc);
+  if (scene_desc.MultiSampleType != D3DMULTISAMPLE_NONE) {
+    scene_resolve_texture = MatchTexture(device, scene_resolve_texture, scene_desc);
+    IDirect3DSurface9* resolved = nullptr;
+    if (scene_resolve_texture == nullptr || FAILED(scene_resolve_texture->GetSurfaceLevel(0, &resolved))) {
+      scene_surface->Release();
+      return false;
+    }
+    const HRESULT resolve_hr = device->StretchRect(scene_surface, nullptr, resolved, nullptr, D3DTEXF_NONE);
+    scene_surface->Release();
+    scene_surface = resolved;
+    if (FAILED(resolve_hr)) {
+      reshade::log::message(reshade::log::level::warning, "sourceengine: swap chain resolve failed");
+      scene_surface->Release();
+      return false;
+    }
+  }
+
+  uint64_t dest_clone = 0;
+  renodx::utils::resource::GetResourceInfo(dest, [&dest_clone](const renodx::utils::resource::ResourceInfo& info) { dest_clone = info.clone.handle; });
+  IDirect3DSurface9* dest_surface = SurfaceOf(dest_clone != 0u ? dest_clone : dest.handle, dest_subresource);
+  if (dest_surface == nullptr) {
+    scene_surface->Release();
+    return false;
+  }
+  D3DSURFACE_DESC desc = {};
+  dest_surface->GetDesc(&desc);
+  const auto to_rect = [](const reshade::api::subresource_box* box) {
+    return box == nullptr ? std::optional<RECT>{} : std::optional<RECT>{{static_cast<LONG>(box->left), static_cast<LONG>(box->top), static_cast<LONG>(box->right), static_cast<LONG>(box->bottom)}};
+  };
+  const auto source_rect = to_rect(source_box);
+  const auto dest_rect = to_rect(dest_box);
+  const auto stretch = [&](IDirect3DSurface9* target, const RECT* target_rect, D3DTEXTUREFILTERTYPE texture_filter) {
+    return device->StretchRect(scene_surface, source_rect ? &*source_rect : nullptr, target, target_rect, texture_filter);
+  };
+  HRESULT hr = E_FAIL;
+  if (dest_clone == 0u && IsThumbnailTarget(desc) && desc.Format != D3DFMT_A16B16G16R16F) {
+    D3DSURFACE_DESC scaled_desc = desc;
+    scaled_desc.Format = D3DFMT_A16B16G16R16F;
+    readback_scene_texture = MatchTexture(device, readback_scene_texture, scaled_desc);
+    IDirect3DSurface9* scaled = nullptr;
+    if (readback_scene_texture != nullptr && SUCCEEDED(readback_scene_texture->GetSurfaceLevel(0, &scaled))) {
+      hr = stretch(scaled, dest_rect ? &*dest_rect : nullptr, D3DTEXF_LINEAR);
+      if (SUCCEEDED(hr)) {
+        IDirect3DBaseTexture9* inputs[] = {readback_scene_texture};
+        DrawFullscreen(device, PostShader(device, &encode_scene_shader, __encode_scene), inputs, dest_surface);
+      }
+      scaled->Release();
+    }
+    std::stringstream log;
+    log << "sourceengine: thumbnail copy to format " << desc.Format << " " << desc.Width << "x" << desc.Height << " hr " << std::hex << static_cast<uint32_t>(hr);
+    reshade::log::message(reshade::log::level::info, log.str().c_str());
+  } else {
+    hr = stretch(dest_surface, dest_rect ? &*dest_rect : nullptr, filter == reshade::api::filter_mode::min_mag_mip_point ? D3DTEXF_POINT : D3DTEXF_LINEAR);
+    if (FAILED(hr)) {
+      std::stringstream log;
+      log << "sourceengine: swap chain copy to format " << desc.Format << " " << desc.Width << "x" << desc.Height << " (clone " << dest_clone << ") failed hr " << std::hex << static_cast<uint32_t>(hr);
+      reshade::log::message(reshade::log::level::warning, log.str().c_str());
+    }
+  }
+  dest_surface->Release();
+  scene_surface->Release();
+  return SUCCEEDED(hr);
+}
+
+bool OnCopyTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box* dest_box, reshade::api::filter_mode filter) {
+  if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return false;
+  if (auto* dest_resource = reinterpret_cast<IDirect3DResource9*>(dest.handle); dest_resource->GetType() == D3DRTYPE_SURFACE) {
+    D3DSURFACE_DESC desc = {};
+    auto* dest_surface = static_cast<IDirect3DSurface9*>(dest_resource);
+    if (SUCCEEDED(dest_surface->GetDesc(&desc)) && desc.Pool == D3DPOOL_SYSTEMMEM) return OnReadback(cmd_list, source, source_subresource, dest_surface, desc);
+  }
+  return CopyFromSwapChain(cmd_list, source, source_box, dest, dest_subresource, dest_box, filter);
+}
+
+bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format) {
+  if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return false;
+  reshade::api::subresource_box dest_box = {};
+  if (source_box != nullptr) {
+    dest_box = {dest_x, dest_y, dest_z, dest_x + source_box->width(), dest_y + source_box->height(), dest_z + source_box->depth()};
+  } else {
+    const auto desc = cmd_list->get_device()->get_resource_desc(source);
+    dest_box = {dest_x, dest_y, dest_z, dest_x + desc.texture.width, dest_y + desc.texture.height, dest_z + 1};
+  }
+  return CopyFromSwapChain(cmd_list, source, source_box, dest, dest_subresource, &dest_box, reshade::api::filter_mode::min_mag_mip_point);
 }
 
 void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect* source_rect, const reshade::api::rect* dest_rect, uint32_t dirty_rect_count, const reshade::api::rect* dirty_rects) {
@@ -1286,15 +1474,17 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         reshade::register_event<reshade::addon_event::present>(OnScenePresent);
         reshade::register_event<reshade::addon_event::draw>(OnDraw);
         reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+        reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+        reshade::register_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
         reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         wchar_t executable_path[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, executable_path, MAX_PATH);
         const wchar_t* executable_name = wcsrchr(executable_path, L'\\');
-        if (_wcsicmp(executable_name != nullptr ? executable_name + 1 : executable_path, L"bms.exe") == 0) {
-          reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
-          reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
-        }
+        const wchar_t* executable = executable_name != nullptr ? executable_name + 1 : executable_path;
+        hook_create_texture = _wcsicmp(executable, L"bms.exe") == 0;
+        reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+        if (hook_create_texture) reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
 
         initialized = true;
       }

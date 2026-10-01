@@ -354,7 +354,11 @@ inline reshade::api::resource CloneResource(
 
   // New: Force Texture2D if surface
   if (new_desc.type == reshade::api::resource_type::surface) {
-    new_desc.type = reshade::api::resource_type::texture_2d;
+    if (new_desc.texture.samples > 1) {
+      new_desc.usage = renodx::utils::bitwise::UnsetFlag(new_desc.usage, reshade::api::resource_usage::shader_resource);
+    } else {
+      new_desc.type = reshade::api::resource_type::texture_2d;
+    }
   }
 
 #ifdef DEBUG_LEVEL_1

@@ -939,13 +939,15 @@ static ProxySharedResourcePair GetProxySharedResourcePair(
   new_desc.usage = static_cast<reshade::api::resource_usage>(
       static_cast<uint32_t>(new_desc.usage)
       | static_cast<uint32_t>(reshade::api::resource_usage::copy_source
-                              | reshade::api::resource_usage::copy_dest));
+                              | reshade::api::resource_usage::copy_dest
+                              | reshade::api::resource_usage::shader_resource));
   if (new_desc.heap == reshade::api::memory_heap::custom) {
     new_desc.heap = reshade::api::memory_heap::gpu_only;
   }
   if (new_desc.type == reshade::api::resource_type::surface) {
     new_desc.type = reshade::api::resource_type::texture_2d;
   }
+  new_desc.texture.samples = 1;
 
   // Override original flags
   new_desc.flags = reshade::api::resource_flags::shared;
