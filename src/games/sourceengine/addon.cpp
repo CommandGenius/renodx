@@ -496,11 +496,25 @@ bool OnVanillaEnginePostDrawFullBloom(reshade::api::command_list* cmd_list) {
   return true;
 }
 
+bool passthrough_swapped = false;
+
+bool OnVanillaScenePassthroughDraw(reshade::api::command_list* cmd_list) {
+  auto* device = GetNativeDevice(cmd_list);
+  if (bloom_texture != nullptr) bloom_texture->Release();
+  bloom_texture = nullptr;
+  bloom_factor_weight = 0.f;
+  passthrough_swapped = EncodedScene(device) != nullptr;
+  if (passthrough_swapped) SwapTextureSlot(device, 0, encoded_texture);
+  return true;
+}
+
 void OnVanillaEnginePostDrawn(reshade::api::command_list* cmd_list) {
   if (untonemapped_texture == nullptr || !histogram_drawn) return;
   auto* device = GetNativeDevice(cmd_list);
   if (post_swapped) RestoreTextureSlot(device, 1);
   post_swapped = false;
+  if (passthrough_swapped) RestoreTextureSlot(device, 0);
+  passthrough_swapped = false;
   IDirect3DSurface9* target = nullptr;
   if (FAILED(CurrentRenderTarget(device, &target)) || target == nullptr) return;
   D3DSURFACE_DESC desc = {};
@@ -577,7 +591,7 @@ bool OnGenericDraw(reshade::api::command_list* cmd_list, F&& draw) {
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
   if (shader_state != nullptr && custom_shaders.contains(renodx::utils::shader::GetCurrentPixelShaderHash(shader_state))) return false;
   const bool reads_scene_at_s1 = BoundTextureIsSceneCopy(device, 1);
-  const bool reads_scene_at_s0 = !reads_scene_at_s1 && !bloom_chain_drawn && BoundTextureIsSceneCopy(device, 0);
+  const bool reads_scene_at_s0 = !reads_scene_at_s1 && BoundTextureIsSceneCopy(device, 0);
   if (!reads_scene_at_s0 && !reads_scene_at_s1) return false;
   IDirect3DSurface9* target = nullptr;
   if (FAILED(CurrentRenderTarget(device, &target)) || target == nullptr) return false;
@@ -586,14 +600,21 @@ bool OnGenericDraw(reshade::api::command_list* cmd_list, F&& draw) {
   target->Release();
   D3DSURFACE_DESC scene_desc = {};
   untonemapped_texture->GetLevelDesc(0, &scene_desc);
-  if (reads_scene_at_s0 && desc.Width < scene_desc.Width) {
+  if (reads_scene_at_s0 && !bloom_chain_drawn && desc.Width < scene_desc.Width) {
     OnVanillaDownsampleDraw(cmd_list);
     draw();
     OnVanillaDownsampleDrawn(cmd_list);
     return true;
   }
-  if (reads_scene_at_s1 && desc.Width == scene_desc.Width && desc.Height == scene_desc.Height && desc.Format == D3DFMT_A16B16G16R16F) {
+  const bool full_size = desc.Width == scene_desc.Width && desc.Height == scene_desc.Height && desc.Format == D3DFMT_A16B16G16R16F;
+  if (full_size && reads_scene_at_s1) {
     OnVanillaEnginePostDrawFullBloom(cmd_list);
+    draw();
+    OnVanillaEnginePostDrawn(cmd_list);
+    return true;
+  }
+  if (full_size && reads_scene_at_s0 && bloom_chain_drawn) {
+    OnVanillaScenePassthroughDraw(cmd_list);
     draw();
     OnVanillaEnginePostDrawn(cmd_list);
     return true;
@@ -748,7 +769,7 @@ bool CopyFromSwapChain(reshade::api::command_list* cmd_list, reshade::api::resou
     hr = S_OK;
   } else {
     hr = stretch(dest_surface, dest_rect ? &*dest_rect : nullptr, filter == reshade::api::filter_mode::min_mag_mip_point ? D3DTEXF_POINT : D3DTEXF_LINEAR);
-    if (FAILED(hr)) {
+    if (static uint32_t failures_logged = 0; FAILED(hr) && failures_logged++ < 8) {
       std::stringstream log;
       log << "sourceengine: swap chain copy to format " << desc.Format << " " << desc.Width << "x" << desc.Height << " msaa " << desc.MultiSampleType << " from " << scene_desc.Width << "x" << scene_desc.Height << " msaa " << scene_desc.MultiSampleType << " (clone " << dest_clone << ") failed hr " << std::hex << static_cast<uint32_t>(hr);
       if (source_rect) log << " src " << std::dec << source_rect->left << "," << source_rect->top << "-" << source_rect->right << "," << source_rect->bottom;
@@ -773,6 +794,12 @@ bool OnCopyTextureRegion(reshade::api::command_list* cmd_list, reshade::api::res
 
 bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t, const reshade::api::subresource_box* source_box, reshade::api::resource dest, uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z, reshade::api::format) {
   if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return false;
+  if (source_box != nullptr) {
+    const auto source_desc = cmd_list->get_device()->get_resource_desc(source);
+    if (source_box->left == 0 && source_box->top == 0 && source_box->width() >= source_desc.texture.width && source_box->height() >= source_desc.texture.height) {
+      source_box = nullptr;
+    }
+  }
   reshade::api::subresource_box dest_box = {};
   if (source_box != nullptr) {
     dest_box = {dest_x, dest_y, dest_z, dest_x + source_box->width(), dest_y + source_box->height(), dest_z + source_box->depth()};
