@@ -60,6 +60,20 @@ bool OnGammaSpaceDrawReplace(reshade::api::command_list* cmd_list) {
   return true;
 }
 
+bool IsPerspectiveDraw(IDirect3DDevice9* device) {
+  float w_row[4] = {};
+  device->GetVertexShaderConstantF(11, w_row, 1);
+  return w_row[0] != 0.f || w_row[1] != 0.f || w_row[2] != 0.f;
+}
+
+bool OnUnlitDrawReplace(reshade::api::command_list* cmd_list) {
+  auto* device = GetNativeDevice(cmd_list);
+  DWORD srgb_write = 0;
+  device->GetRenderState(D3DRS_SRGBWRITEENABLE, &srgb_write);
+  shader_injection.srgb_write_off = (srgb_write == 0 && !IsPerspectiveDraw(device)) ? 1.f : 0.f;
+  return true;
+}
+
 using CreateTextureFunction = HRESULT(STDMETHODCALLTYPE*)(
     IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*);
 CreateTextureFunction original_create_texture = nullptr;
@@ -200,6 +214,7 @@ IDirect3DBaseTexture9* bloom_texture = nullptr;
 float bloom_factor[4] = {};
 IDirect3DPixelShader9* encode_scene_shader = nullptr;
 IDirect3DPixelShader9* post_upgrade_shader = nullptr;
+IDirect3DPixelShader9* copy_scene_shader = nullptr;
 IDirect3DDevice9* post_shader_device = nullptr;
 
 IDirect3DTexture9* MatchTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture, const D3DSURFACE_DESC& desc) {
@@ -215,9 +230,10 @@ IDirect3DTexture9* MatchTexture(IDirect3DDevice9* device, IDirect3DTexture9* tex
 
 IDirect3DPixelShader9* PostShader(IDirect3DDevice9* device, IDirect3DPixelShader9** shader, std::span<const uint8_t> code) {
   if (post_shader_device != device) {
-    if (encode_scene_shader != nullptr) encode_scene_shader->Release();
-    if (post_upgrade_shader != nullptr) post_upgrade_shader->Release();
-    encode_scene_shader = post_upgrade_shader = nullptr;
+    for (auto** stale : {&encode_scene_shader, &post_upgrade_shader, &copy_scene_shader}) {
+      if (*stale != nullptr) (*stale)->Release();
+      *stale = nullptr;
+    }
     post_shader_device = device;
   }
   if (*shader == nullptr) device->CreatePixelShader(reinterpret_cast<const DWORD*>(code.data()), shader);
@@ -229,6 +245,12 @@ class FullscreenPass {
   FullscreenPass(IDirect3DDevice9* device, IDirect3DPixelShader9* shader, std::span<IDirect3DBaseTexture9* const> textures, IDirect3DSurface9* target)
       : device_(device) {
     if (shader == nullptr || target == nullptr || FAILED(device->CreateStateBlock(D3DSBT_ALL, &state_))) return;
+    state_->Capture();
+    device->GetRenderState(D3DRS_SRGBWRITEENABLE, &srgb_write_);
+    slot_count_ = std::min<DWORD>(static_cast<DWORD>(textures.size()), MAX_SLOTS);
+    for (DWORD slot = 0; slot < slot_count_; ++slot) {
+      for (size_t i = 0; i < std::size(SAMPLER_STATES); ++i) device->GetSamplerState(slot, SAMPLER_STATES[i], &sampler_states_[slot][i]);
+    }
     D3DSURFACE_DESC target_desc = {};
     target->GetDesc(&target_desc);
     CurrentRenderTarget(device, &previous_target_);
@@ -272,6 +294,10 @@ class FullscreenPass {
     if (previous_depth_ != nullptr) previous_depth_->Release();
     state_->Apply();
     state_->Release();
+    device_->SetRenderState(D3DRS_SRGBWRITEENABLE, srgb_write_);
+    for (DWORD slot = 0; slot < slot_count_; ++slot) {
+      for (size_t i = 0; i < std::size(SAMPLER_STATES); ++i) device_->SetSamplerState(slot, SAMPLER_STATES[i], sampler_states_[slot][i]);
+    }
   }
 
   void Draw(const float* constants_c0 = nullptr) {
@@ -287,10 +313,16 @@ class FullscreenPass {
   }
 
  private:
+  static constexpr DWORD MAX_SLOTS = 4;
+  static constexpr D3DSAMPLERSTATETYPE SAMPLER_STATES[] = {D3DSAMP_SRGBTEXTURE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER};
+
   IDirect3DDevice9* device_;
   IDirect3DStateBlock9* state_ = nullptr;
   IDirect3DSurface9* previous_target_ = nullptr;
   IDirect3DSurface9* previous_depth_ = nullptr;
+  DWORD srgb_write_ = 0;
+  DWORD slot_count_ = 0;
+  DWORD sampler_states_[MAX_SLOTS][std::size(SAMPLER_STATES)] = {};
   float width_ = 0.f;
   float height_ = 0.f;
 };
@@ -532,9 +564,7 @@ bool OnGenericDraw(reshade::api::command_list* cmd_list, F&& draw) {
   if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return false;
   auto* device = GetNativeDevice(cmd_list);
   if (!perspective_drawn || pending_scene_target.handle != 0u) {
-    float w_row[4] = {};
-    device->GetVertexShaderConstantF(11, w_row, 1);
-    const bool perspective = w_row[0] != 0.f || w_row[1] != 0.f || w_row[2] != 0.f;
+    const bool perspective = IsPerspectiveDraw(device);
     perspective_drawn |= perspective;
     if (pending_scene_target.handle != 0u) ActivateSceneTarget(cmd_list, device, perspective);
   }
@@ -589,7 +619,7 @@ void OnDestroyDevice(reshade::api::device* device) {
     if (*texture != nullptr) (*texture)->Release();
     *texture = nullptr;
   }
-  for (auto** shader : {&encode_scene_shader, &post_upgrade_shader}) {
+  for (auto** shader : {&encode_scene_shader, &post_upgrade_shader, &copy_scene_shader}) {
     if (*shader != nullptr) (*shader)->Release();
     *shader = nullptr;
   }
@@ -706,11 +736,23 @@ bool CopyFromSwapChain(reshade::api::command_list* cmd_list, reshade::api::resou
     std::stringstream log;
     log << "sourceengine: thumbnail copy to format " << desc.Format << " " << desc.Width << "x" << desc.Height << " hr " << std::hex << static_cast<uint32_t>(hr);
     reshade::log::message(reshade::log::level::info, log.str().c_str());
+  } else if (desc.MultiSampleType != D3DMULTISAMPLE_NONE && scene_resolve_texture != nullptr) {
+    const float source_uv[4] = {
+        source_rect ? static_cast<float>(source_rect->left) / static_cast<float>(scene_desc.Width) : 0.f,
+        source_rect ? static_cast<float>(source_rect->top) / static_cast<float>(scene_desc.Height) : 0.f,
+        source_rect ? static_cast<float>(source_rect->right - source_rect->left) / static_cast<float>(scene_desc.Width) : 1.f,
+        source_rect ? static_cast<float>(source_rect->bottom - source_rect->top) / static_cast<float>(scene_desc.Height) : 1.f,
+    };
+    IDirect3DBaseTexture9* inputs[] = {scene_resolve_texture};
+    DrawFullscreen(device, PostShader(device, &copy_scene_shader, __copy_scene), inputs, dest_surface, source_uv);
+    hr = S_OK;
   } else {
     hr = stretch(dest_surface, dest_rect ? &*dest_rect : nullptr, filter == reshade::api::filter_mode::min_mag_mip_point ? D3DTEXF_POINT : D3DTEXF_LINEAR);
     if (FAILED(hr)) {
       std::stringstream log;
-      log << "sourceengine: swap chain copy to format " << desc.Format << " " << desc.Width << "x" << desc.Height << " (clone " << dest_clone << ") failed hr " << std::hex << static_cast<uint32_t>(hr);
+      log << "sourceengine: swap chain copy to format " << desc.Format << " " << desc.Width << "x" << desc.Height << " msaa " << desc.MultiSampleType << " from " << scene_desc.Width << "x" << scene_desc.Height << " msaa " << scene_desc.MultiSampleType << " (clone " << dest_clone << ") failed hr " << std::hex << static_cast<uint32_t>(hr);
+      if (source_rect) log << " src " << std::dec << source_rect->left << "," << source_rect->top << "-" << source_rect->right << "," << source_rect->bottom;
+      if (dest_rect) log << " dst " << std::dec << dest_rect->left << "," << dest_rect->top << "-" << dest_rect->right << "," << dest_rect->bottom;
       reshade::log::message(reshade::log::level::warning, log.str().c_str());
     }
   }
@@ -734,11 +776,8 @@ bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::
   reshade::api::subresource_box dest_box = {};
   if (source_box != nullptr) {
     dest_box = {dest_x, dest_y, dest_z, dest_x + source_box->width(), dest_y + source_box->height(), dest_z + source_box->depth()};
-  } else {
-    const auto desc = cmd_list->get_device()->get_resource_desc(source);
-    dest_box = {dest_x, dest_y, dest_z, dest_x + desc.texture.width, dest_y + desc.texture.height, dest_z + 1};
   }
-  return CopyFromSwapChain(cmd_list, source, source_box, dest, dest_subresource, &dest_box, reshade::api::filter_mode::min_mag_mip_point);
+  return CopyFromSwapChain(cmd_list, source, source_box, dest, dest_subresource, source_box != nullptr ? &dest_box : nullptr, reshade::api::filter_mode::min_mag_mip_linear);
 }
 
 void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect* source_rect, const reshade::api::rect* dest_rect, uint32_t dirty_rect_count, const reshade::api::rect* dirty_rects) {
@@ -862,11 +901,11 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     {0xCFAFE6F6, {.crc32 = 0xCFAFE6F6, .on_draw = &OnUiDraw}},
     {0x201ADBD3, {.crc32 = 0x201ADBD3, .on_draw = &OnUiDraw}},
     {0x030AF021, {.crc32 = 0x030AF021, .on_draw = &OnUiDraw}},
-    {0x23B789C1, {.crc32 = 0x23B789C1, .code = __0x23B789C1, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
-    {0x0DEE26BF, {.crc32 = 0x0DEE26BF, .code = __0x0DEE26BF, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
-    {0xEE27D62A, {.crc32 = 0xEE27D62A, .code = __0xEE27D62A, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
-    {0xBB6A22F0, {.crc32 = 0xBB6A22F0, .code = __0xBB6A22F0, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
-    {0x20B2481D, {.crc32 = 0x20B2481D, .code = __0x20B2481D, .on_replace = &OnGammaSpaceDrawReplace, .on_draw = &OnUiDraw}},
+    {0x23B789C1, {.crc32 = 0x23B789C1, .code = __0x23B789C1, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
+    {0x0DEE26BF, {.crc32 = 0x0DEE26BF, .code = __0x0DEE26BF, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
+    {0xEE27D62A, {.crc32 = 0xEE27D62A, .code = __0xEE27D62A, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
+    {0xBB6A22F0, {.crc32 = 0xBB6A22F0, .code = __0xBB6A22F0, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
+    {0x20B2481D, {.crc32 = 0x20B2481D, .code = __0x20B2481D, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
     CustomShaderEntryCallback(0x51AF5BEF, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0xAF2589CC, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0x8837F356, &OnGammaSpaceDrawReplace),
