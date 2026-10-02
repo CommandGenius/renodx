@@ -592,7 +592,10 @@ bool OnGenericDraw(reshade::api::command_list* cmd_list, F&& draw) {
   if (shader_state != nullptr && custom_shaders.contains(renodx::utils::shader::GetCurrentPixelShaderHash(shader_state))) return false;
   const bool reads_scene_at_s1 = BoundTextureIsSceneCopy(device, 1);
   const bool reads_scene_at_s0 = !reads_scene_at_s1 && BoundTextureIsSceneCopy(device, 0);
-  if (!reads_scene_at_s0 && !reads_scene_at_s1) return false;
+  if (!reads_scene_at_s0 && !reads_scene_at_s1) {
+    if (!bloom_chain_drawn && !raw_scene_tone_mapped && !IsPerspectiveDraw(device)) OnUiDraw(cmd_list);
+    return false;
+  }
   IDirect3DSurface9* target = nullptr;
   if (FAILED(CurrentRenderTarget(device, &target)) || target == nullptr) return false;
   D3DSURFACE_DESC desc = {};
@@ -933,6 +936,8 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     {0xEE27D62A, {.crc32 = 0xEE27D62A, .code = __0xEE27D62A, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
     {0xBB6A22F0, {.crc32 = 0xBB6A22F0, .code = __0xBB6A22F0, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
     {0x20B2481D, {.crc32 = 0x20B2481D, .code = __0x20B2481D, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
+    {0x7BBB7B71, {.crc32 = 0x7BBB7B71, .code = __0x7BBB7B71, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
+    {0x66FF3787, {.crc32 = 0x66FF3787, .code = __0x66FF3787, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
     CustomShaderEntryCallback(0x51AF5BEF, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0xAF2589CC, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0x8837F356, &OnGammaSpaceDrawReplace),
