@@ -69,8 +69,10 @@ bool IsPerspectiveDraw(IDirect3DDevice9* device) {
 bool OnUnlitDrawReplace(reshade::api::command_list* cmd_list) {
   auto* device = GetNativeDevice(cmd_list);
   DWORD srgb_write = 0;
+  DWORD srgb_read = 0;
   device->GetRenderState(D3DRS_SRGBWRITEENABLE, &srgb_write);
-  shader_injection.srgb_write_off = (srgb_write == 0 && !IsPerspectiveDraw(device)) ? 1.f : 0.f;
+  device->GetSamplerState(0, D3DSAMP_SRGBTEXTURE, &srgb_read);
+  shader_injection.srgb_write_off = (srgb_write == 0 && srgb_read == 0 && !IsPerspectiveDraw(device)) ? 1.f : 0.f;
   return true;
 }
 
