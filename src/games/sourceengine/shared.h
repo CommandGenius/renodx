@@ -85,16 +85,21 @@ struct ShaderInjectData {
   float scene_exposure;
   float linear_input;
 
-  float scene_exposure_pad;
+  float psychov_cone_response;
   float bloom_strength;
   float scene_post_drawn;
-  float scene_exposure_pad2;
+  float psychov_compression;
+
+  float psychov_gamut_compression;
+  float psychov_target_gamut;
+  float psychov_source_boundary;
+  float psychov_pad;
 };
 
 #ifndef __cplusplus
 #if (__SHADER_TARGET_MAJOR == 3)
 
-float4 shader_injection[10] : register(c210);
+float4 shader_injection[11] : register(c210);
 
 #define RENODX_PEAK_WHITE_NITS               shader_injection[0][0]
 #define RENODX_DIFFUSE_WHITE_NITS            shader_injection[0][1]
@@ -130,6 +135,11 @@ float4 shader_injection[10] : register(c210);
 #define RENODX_BLOOM_VALID                     shader_injection[7][3]
 #define RENODX_BLOOM_STRENGTH                  shader_injection[9][1]
 #define RENODX_SCENE_POST_DRAWN                shader_injection[9][2]
+#define RENODX_PSYCHOV_CONE_RESPONSE           shader_injection[9][0]
+#define RENODX_PSYCHOV_COMPRESSION             shader_injection[9][3]
+#define RENODX_PSYCHOV_GAMUT_COMPRESSION       shader_injection[10][0]
+#define RENODX_PSYCHOV_TARGET_GAMUT            shader_injection[10][1]
+#define RENODX_PSYCHOV_SOURCE_BOUNDARY         shader_injection[10][2]
 #define RENODX_CUSTOM_FLIP_UV_Y                shader_injection[8][0]
 #define RENODX_SRGB_WRITE_OFF                  shader_injection[8][1]
 #define RENODX_SCENE_EXPOSURE                  shader_injection[8][2]
@@ -182,6 +192,11 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_BLOOM_VALID                     shader_injection.bloom_valid
 #define RENODX_BLOOM_STRENGTH                  shader_injection.bloom_strength
 #define RENODX_SCENE_POST_DRAWN                shader_injection.scene_post_drawn
+#define RENODX_PSYCHOV_CONE_RESPONSE           shader_injection.psychov_cone_response
+#define RENODX_PSYCHOV_COMPRESSION             shader_injection.psychov_compression
+#define RENODX_PSYCHOV_GAMUT_COMPRESSION       shader_injection.psychov_gamut_compression
+#define RENODX_PSYCHOV_TARGET_GAMUT            shader_injection.psychov_target_gamut
+#define RENODX_PSYCHOV_SOURCE_BOUNDARY         shader_injection.psychov_source_boundary
 #define RENODX_CUSTOM_FLIP_UV_Y                shader_injection.custom_flip_uv_y
 #define RENODX_SRGB_WRITE_OFF                  shader_injection.srgb_write_off
 #define RENODX_SCENE_EXPOSURE                  shader_injection.scene_exposure
