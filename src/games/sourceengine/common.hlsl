@@ -80,18 +80,4 @@ float3 GammaSpaceOutput(float3 color) {
   return color;
 }
 
-float3 EmulateDisplayGamma(float3 linear_color) {
-  if (RENODX_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_2) {
-    linear_color = renodx::color::correct::GammaSafe(linear_color, false, 2.2f);
-  } else if (RENODX_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_4) {
-    linear_color = renodx::color::correct::GammaSafe(linear_color, false, 2.4f);
-  }
-  if (RENODX_SWAP_CHAIN_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_2) {
-    linear_color = renodx::color::correct::GammaSafe(linear_color, true, 2.2f);
-  } else if (RENODX_SWAP_CHAIN_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_4) {
-    linear_color = renodx::color::correct::GammaSafe(linear_color, true, 2.4f);
-  }
-  return linear_color;
-}
-
 #endif  // SRC_SOURCEENGINE_COMMON_HLSL_
