@@ -1,4 +1,4 @@
-#include "./shared.h"
+#include "./common.hlsl"
 
 sampler2D YTextureSampler : register(s0);
 sampler2D cRTextureSampler : register(s1);
@@ -20,5 +20,5 @@ float4 main(float2 uv : TEXCOORD0, float4 fog : TEXCOORD1) : COLOR0 {
 
   float fog_factor = saturate(min(fog.w * g_FogParams.w - g_FogParams.x, g_FogParams.z));
   fog_factor *= fog_factor;
-  return float4(renodx::color::srgb::Decode(saturate(lerp(rgb, g_LinearFogColor.rgb, fog_factor))), 1.f);
+  return float4(EmulateDisplayGamma(renodx::color::srgb::Decode(saturate(lerp(rgb, g_LinearFogColor.rgb, fog_factor)))), 1.f);
 }
