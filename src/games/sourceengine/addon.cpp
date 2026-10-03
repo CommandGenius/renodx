@@ -378,7 +378,7 @@ void TonemapRawScene(IDirect3DDevice9* device, IDirect3DSurface9* target, const 
       device->StretchRect(target, nullptr, keep, nullptr, D3DTEXF_NONE);
       keep->Release();
     }
-    shader_injection.scene_exposure = SceneExposureFor(current_light_scale);
+    shader_injection.scene_exposure = light_scale_used ? SceneExposureFor(current_light_scale) : 1.f;
   }
   if (desc.Format == D3DFMT_A16B16G16R16F && untonemapped_texture != nullptr) {
     const float params[4] = {0.f, 1.f, 0.f, 0.f};
@@ -398,12 +398,26 @@ bool OnUiDraw(reshade::api::command_list* cmd_list) {
     device->GetVertexShaderConstantF(8, view_projection[0], 4);
     const bool vgui = view_projection[3][0] == 0.f && view_projection[3][1] == 0.f && view_projection[3][2] == 0.f
                       && std::abs(view_projection[0][0]) < 0.1f;
-    if (!perspective_drawn || !vgui || histogram_drawn_last_frame) return true;
+    DWORD stencil = 0;
+    device->GetRenderState(D3DRS_STENCILENABLE, &stencil);
+    if (!perspective_drawn || !vgui || histogram_drawn_last_frame || stencil != 0) return true;
   }
   IDirect3DSurface9* target = nullptr;
   if (FAILED(CurrentRenderTarget(device, &target)) || target == nullptr) return true;
   D3DSURFACE_DESC desc = {};
   target->GetDesc(&desc);
+  if (!histogram_drawn) {
+    IDirect3DSurface9* back_buffer = nullptr;
+    D3DSURFACE_DESC back_desc = {};
+    if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back_buffer)) && back_buffer != nullptr) {
+      back_buffer->GetDesc(&back_desc);
+      back_buffer->Release();
+    }
+    if (desc.Width != back_desc.Width || desc.Height != back_desc.Height) {
+      target->Release();
+      return true;
+    }
+  }
   if (histogram_drawn || desc.Format == D3DFMT_A16B16G16R16F) TonemapRawScene(device, target, desc);
   target->Release();
   return true;
@@ -823,6 +837,11 @@ void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain*
       if (desc.Format == D3DFMT_A16B16G16R16F) TonemapRawScene(device, target, desc);
       target->Release();
     }
+  }
+  if (static uint32_t frames_without_histogram = 0; perspective_drawn && !histogram_drawn) {
+    if (++frames_without_histogram >= 120) light_scale_used = false;
+  } else {
+    frames_without_histogram = 0;
   }
   shader_injection.scene_tone_mapped = engine_post_drawn ? 1.f : 0.f;
   engine_post_drawn = false;
