@@ -72,7 +72,12 @@ bool OnUnlitDrawReplace(reshade::api::command_list* cmd_list) {
   DWORD srgb_read = 0;
   device->GetRenderState(D3DRS_SRGBWRITEENABLE, &srgb_write);
   device->GetSamplerState(0, D3DSAMP_SRGBTEXTURE, &srgb_read);
-  shader_injection.srgb_write_off = (srgb_write == 0 && srgb_read == 0 && !IsPerspectiveDraw(device)) ? 1.f : 0.f;
+  DWORD blend = 0;
+  DWORD dest_blend = 0;
+  device->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+  device->GetRenderState(D3DRS_DESTBLEND, &dest_blend);
+  const bool additive = blend != 0 && dest_blend == D3DBLEND_ONE;
+  shader_injection.srgb_write_off = (srgb_write == 0 && !additive && !IsPerspectiveDraw(device)) ? (srgb_read == 0 ? 1.f : 2.f) : 0.f;
   return true;
 }
 

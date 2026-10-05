@@ -20,7 +20,9 @@ float4 main(float2 uv : TEXCOORD0, float4 vertexColor : TEXCOORD2, float3 fogCoo
 
   float alpha = base.a * g_DiffuseModulation.a;
   alpha = lerp(alpha, alpha * vertexColor.a, g_ShaderControls.w);
-  float3 color = base.rgb * g_DiffuseModulation.rgb * vertexColor.rgb;
+  float3 tint = g_DiffuseModulation.rgb * vertexColor.rgb;
+  if (RENODX_SRGB_WRITE_OFF == 2.f) tint = renodx::color::srgb::Decode(saturate(tint));
+  float3 color = base.rgb * tint;
 
   float fog_alpha = lerp(alpha, f, g_ShaderControls.z);
   float out_alpha = g_ShaderControls.y * (fogCoord.z * g_LinearFogColor.w - fog_alpha) + fog_alpha;
