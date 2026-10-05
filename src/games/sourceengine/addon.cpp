@@ -773,9 +773,11 @@ bool CopyFromSwapChain(reshade::api::command_list* cmd_list, reshade::api::resou
       }
       scaled->Release();
     }
-    std::stringstream log;
-    log << "sourceengine: thumbnail copy to format " << desc.Format << " " << desc.Width << "x" << desc.Height << " hr " << std::hex << static_cast<uint32_t>(hr);
-    reshade::log::message(reshade::log::level::info, log.str().c_str());
+    if (static uint32_t thumbnails_logged = 0; thumbnails_logged++ < 8) {
+      std::stringstream log;
+      log << "sourceengine: thumbnail copy to format " << desc.Format << " " << desc.Width << "x" << desc.Height << " hr " << std::hex << static_cast<uint32_t>(hr);
+      reshade::log::message(reshade::log::level::info, log.str().c_str());
+    }
   } else if (desc.MultiSampleType != D3DMULTISAMPLE_NONE && scene_resolve_texture != nullptr) {
     const float source_uv[4] = {
         source_rect ? static_cast<float>(source_rect->left) / static_cast<float>(scene_desc.Width) : 0.f,
