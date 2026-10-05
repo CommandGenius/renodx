@@ -204,6 +204,8 @@ static float* resource_tag_float = nullptr;
 static int32_t expected_constant_buffer_index = -1;
 static uint32_t expected_constant_buffer_space = 0;
 static uint32_t constant_buffer_offset = 0;
+// Alignment of the custom push constant start (in 32-bit values). 0 disables additional alignment.
+static uint32_t push_constant_alignment = 4u;
 static auto minimum_constant_buffer_stages = reshade::api::shader_stage::pixel | reshade::api::shader_stage::compute;
 
 static renodx::utils::data::ParallelNodeHashMap<uint32_t, CustomShader> custom_shaders;
@@ -1062,9 +1064,17 @@ static bool OnCreatePipelineLayout(
       return false;
     }
 
+    if (is_vulkan && push_constant_alignment != 0u) {
+      const uint32_t remainder = vk_pc_offset % push_constant_alignment;
+      if (remainder != 0u) {
+        vk_pc_offset += push_constant_alignment - remainder;
+      }
+    }
+
     constant_injection_cost = std::min(slots, remaining_dword_count);
     if (expand_vulkan_push_constants) {
-      new_params[injection_index].push_constants.count += constant_injection_cost;
+      new_params[injection_index].push_constants.count =
+          vk_pc_offset - new_params[injection_index].push_constants.binding + constant_injection_cost;
     } else {
       new_params[injection_index] = reshade::api::pipeline_layout_param(
           reshade::api::constant_range{
@@ -1485,8 +1495,16 @@ static void OnInitPipelineLayout(
             remaining_dword_count = used_dword_count >= 64u ? 0u : 64u - used_dword_count;
           }
 
+          if (is_vulkan && push_constant_alignment != 0u) {
+            const uint32_t remainder = vk_pc_offset % push_constant_alignment;
+            if (remainder != 0u) {
+              vk_pc_offset += push_constant_alignment - remainder;
+            }
+          }
+
           if (expand_vulkan_push_constants) {
-            new_params[injection_index].push_constants.count += std::min(slots, remaining_dword_count);
+            new_params[injection_index].push_constants.count =
+                vk_pc_offset - new_params[injection_index].push_constants.binding + std::min(slots, remaining_dword_count);
           } else {
             new_params[injection_index] = reshade::api::pipeline_layout_param(
                 reshade::api::constant_range{
@@ -2011,8 +2029,14 @@ inline constexpr auto OnCommandAction = []<typename T, typename Context>(
     const auto custom_pipeline = custom_shader_info->get_replacement_pipeline != nullptr
                                      ? custom_shader_info->get_replacement_pipeline(context.cmd_list)
                                      : reshade::api::pipeline{0u};
+    reshade::api::pipeline resolved_replacement = {0u};
+    auto resolved_stages = static_cast<reshade::api::pipeline_stage>(0u);
+    bool replacement_ready = false;
     if (custom_pipeline.handle == 0u) {
-      utils::shader::BuildReplacementPipeline(state.pipeline);
+      replacement_ready = utils::shader::WithReplacementPipeline(state.pipeline, [&](auto replacement, auto stages) {
+        resolved_replacement = replacement;
+        resolved_stages = stages;
+      });
     }
 
     // Perform Push
@@ -2071,7 +2095,14 @@ inline constexpr auto OnCommandAction = []<typename T, typename Context>(
       context.cmd_list->bind_pipeline(state.applied_stage, custom_pipeline);
       applied_replacement = true;
     } else {
-      applied_replacement = utils::shader::ApplyReplacement(context.cmd_list, &state);
+      if (replacement_ready) {
+        if (resolved_replacement.handle == 0u) {
+          applied_replacement = true;
+        } else if (utils::bitwise::HasFlag(resolved_stages, state.stage)) {
+          context.cmd_list->bind_pipeline(state.applied_stage, resolved_replacement);
+          applied_replacement = true;
+        }
+      }
     }
 
     if (!custom_shader_info->views.empty()) {
@@ -2451,6 +2482,8 @@ static void Use(DWORD fdw_reason, const CustomShaderList& new_custom_shaders, T*
       if (custom_shader.index != -1) using_counted_shaders = true;
     }
     renodx::utils::shader::use_replace_on_bind = !(using_custom_replace || using_custom_inject);
+    renodx::utils::state::use_pipeline_tracking = true;
+    renodx::utils::state::use_snapshot |= revert_constant_buffer_ranges;
     renodx::utils::state::Use(fdw_reason);
   }
 
