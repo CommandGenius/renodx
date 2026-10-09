@@ -31,6 +31,31 @@ float3 SampleFramebuffer(float2 uv) {
   return FramebufferToGamma(tex2D(FBTextureSampler, uv).rgb);
 }
 
+float3 UnclampLut(float3 original_gamma, float3 black_gamma, float3 mid_gray_gamma, float3 white_gamma, float3 neutral_gamma) {
+  const float3 added_gamma = black_gamma;
+  const float3 removed_gamma = 1.f - min(1.f, white_gamma);
+  const float mid_gray_average = (mid_gray_gamma.r + mid_gray_gamma.g + mid_gray_gamma.b) / 3.f;
+
+  const float shadow_length = mid_gray_average;
+  const float shadow_stop = max(neutral_gamma.r, max(neutral_gamma.g, neutral_gamma.b));
+  const float3 floor_remove = added_gamma * max(0.f, shadow_length - shadow_stop) / shadow_length;
+
+  const float highlights_length = 1.f - mid_gray_average;
+  const float highlights_stop = 1.f - min(neutral_gamma.r, min(neutral_gamma.g, neutral_gamma.b));
+  const float3 ceiling_add = removed_gamma * (max(0.f, highlights_length - highlights_stop) / highlights_length);
+
+  return max(0.f, original_gamma - floor_remove) + ceiling_add;
+}
+
+float3 RecolorUnclampedLut(float3 original_linear, float3 unclamped_linear) {
+  const float3 original_perceptual = renodx::color::oklab::from::BT709(original_linear);
+  float3 retinted_perceptual = renodx::color::oklab::from::BT709(unclamped_linear);
+  retinted_perceptual[0] = max(0.f, retinted_perceptual[0]);
+  retinted_perceptual[1] = original_perceptual[1];
+  retinted_perceptual[2] = original_perceptual[2];
+  return renodx::color::bt709::clamp::BT2020(renodx::color::bt709::from::OkLab(retinted_perceptual));
+}
+
 float3 PerformColorCorrection(float3 color) {
 #if (COL_CORRECT_NUM_LOOKUPS > 0)
   float3 lut_uv = color * (31.f / 32.f) + (0.5f / 32.f);
@@ -180,8 +205,18 @@ float4 main(float2 baseTexCoord : TEXCOORD0) : COLOR0 {
   } else {
     neutral_sdr = untonemapped / max(1.f, renodx::math::Max(untonemapped));
   }
-  float3 graded_sdr = renodx::color::srgb::DecodeSafe(
-      PerformColorCorrection(renodx::color::srgb::Encode(neutral_sdr)));
+  const float3 neutral_gamma = renodx::color::srgb::Encode(neutral_sdr);
+  const float3 graded_gamma = PerformColorCorrection(neutral_gamma);
+  float3 graded_sdr = renodx::color::srgb::DecodeSafe(graded_gamma);
+  if (RENODX_TONE_MAP_TYPE != 0.f) {
+    const float3 unclamped_gamma = UnclampLut(
+        graded_gamma,
+        PerformColorCorrection(0.f),
+        PerformColorCorrection(renodx::color::srgb::Encode(0.18f)),
+        PerformColorCorrection(1.f),
+        neutral_gamma);
+    graded_sdr = RecolorUnclampedLut(graded_sdr, renodx::color::srgb::DecodeSafe(unclamped_gamma));
+  }
   graded_sdr = lerp(neutral_sdr, graded_sdr, RENODX_COLOR_GRADE_STRENGTH);
   return float4(ToneMapScene(untonemapped, graded_sdr, neutral_sdr), 1.f);
 #else
