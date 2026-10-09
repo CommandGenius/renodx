@@ -399,8 +399,21 @@ bool OnUiDraw(reshade::api::command_list* cmd_list) {
     const bool vgui = view_projection[3][0] == 0.f && view_projection[3][1] == 0.f && view_projection[3][2] == 0.f
                       && std::abs(view_projection[0][0]) < 0.1f;
     DWORD stencil = 0;
+    DWORD stencil_func = D3DCMP_ALWAYS;
     device->GetRenderState(D3DRS_STENCILENABLE, &stencil);
-    if (!perspective_drawn || !vgui || histogram_drawn_last_frame || stencil != 0) return true;
+    device->GetRenderState(D3DRS_STENCILFUNC, &stencil_func);
+    bool render_target_source = false;
+    IDirect3DBaseTexture9* source = nullptr;
+    device->GetTexture(0, &source);
+    if (source != nullptr) {
+      D3DSURFACE_DESC source_desc = {};
+      if (source->GetType() == D3DRTYPE_TEXTURE && SUCCEEDED(static_cast<IDirect3DTexture9*>(source)->GetLevelDesc(0, &source_desc))) {
+        render_target_source = (source_desc.Usage & D3DUSAGE_RENDERTARGET) != 0;
+      }
+      source->Release();
+    }
+    const bool stencil_test = (stencil != 0 && (stencil_func == D3DCMP_EQUAL || stencil_func == D3DCMP_NOTEQUAL)) || render_target_source;
+    if (!perspective_drawn || !vgui || histogram_drawn_last_frame || stencil_test) return true;
   }
   IDirect3DSurface9* target = nullptr;
   if (FAILED(CurrentRenderTarget(device, &target)) || target == nullptr) return true;
