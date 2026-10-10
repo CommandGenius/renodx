@@ -844,7 +844,7 @@ bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::
 void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect* source_rect, const reshade::api::rect* dest_rect, uint32_t dirty_rect_count, const reshade::api::rect* dirty_rects) {
   if (queue->get_device()->get_api() != reshade::api::device_api::d3d9) return;
   auto* device = reinterpret_cast<IDirect3DDevice9*>(queue->get_device()->get_native());
-  if (!histogram_drawn && histogram_drawn_last_frame && light_scale_used && !engine_post_drawn && !raw_scene_tone_mapped && perspective_drawn) {
+  if (!histogram_drawn && !engine_post_drawn && !raw_scene_tone_mapped && perspective_drawn) {
     IDirect3DSurface9* target = nullptr;
     if (SUCCEEDED(CurrentRenderTarget(device, &target)) && target != nullptr) {
       D3DSURFACE_DESC desc = {};
