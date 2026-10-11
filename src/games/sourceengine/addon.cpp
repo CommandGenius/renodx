@@ -21,7 +21,6 @@
 #include "../../mods/swapchain.hpp"
 #include "../../utils/directx.hpp"
 #include "../../utils/settings.hpp"
-#include "./eye_adaptation.hpp"
 #include "./portal2_hashes.hpp"
 #include "./shared.h"
 
@@ -336,10 +335,9 @@ void DrawFullscreen(IDirect3DDevice9* device, IDirect3DPixelShader9* shader, std
 float current_light_scale = 1.f;
 bool light_scale_used = false;
 
-sourceengine::EyeAdaptation eye_adaptation;
-float max_map_exposure = 0.f;
+float map_light_scale = 0.f;
+float light_scale_last_frame = 1.f;
 uint32_t textures_created_since_present = 0;
-std::chrono::steady_clock::time_point map_load_time{};
 
 bool IsMapTexture(const reshade::api::resource_desc& desc) {
   return desc.type == reshade::api::resource_type::texture_2d && desc.texture.width >= 128 && desc.texture.height >= 128;
@@ -363,8 +361,7 @@ void OnDestroyMapTexture(reshade::api::device* device, reshade::api::resource re
 }
 
 float SceneExposureFor(float light_scale) {
-  const float exposure = std::max(max_map_exposure, eye_adaptation.exposure);
-  return light_scale > 0.f ? exposure / light_scale : exposure;
+  return light_scale > 0.f ? std::max(map_light_scale, light_scale) / light_scale : 1.f;
 }
 
 IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
@@ -374,6 +371,8 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   scene_copy_texture = texture;
   histogram_drawn = true;
   if (current_light_scale != 1.f) light_scale_used = true;
+  const bool ramping_up = current_light_scale == 1.f || current_light_scale > light_scale_last_frame + 1e-4f;
+  if (current_light_scale >= map_light_scale || !ramping_up) map_light_scale = current_light_scale;
   shader_injection.scene_exposure = SceneExposureFor(current_light_scale);
   if (texture == nullptr || texture->GetType() != D3DRTYPE_TEXTURE) return nullptr;
   auto* copy = static_cast<IDirect3DTexture9*>(texture);
@@ -388,13 +387,6 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   untonemapped_texture->GetSurfaceLevel(0, &keep);
   device->StretchRect(source, nullptr, keep, nullptr, D3DTEXF_NONE);
   keep->Release();
-  eye_adaptation.Update(device, untonemapped_texture, current_light_scale);
-  const auto now = std::chrono::steady_clock::now();
-  if (map_load_time.time_since_epoch().count() == 0) map_load_time = now;
-  const auto since_load = now - map_load_time;
-  if (since_load > std::chrono::milliseconds(2500) && since_load <= std::chrono::milliseconds(5000)) {
-    max_map_exposure = std::max(max_map_exposure, eye_adaptation.exposure);
-  }
   return source;
 }
 
@@ -707,7 +699,6 @@ void OnDestroyDevice(reshade::api::device* device) {
     if (*shader != nullptr) (*shader)->Release();
     *shader = nullptr;
   }
-  eye_adaptation.Release();
   post_shader_device = nullptr;
 }
 
@@ -895,9 +886,7 @@ void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain*
   if (perspective_drawn) {
     if (load_textures >= 150) {
       light_scale_used = false;
-      max_map_exposure = 0.f;
-      eye_adaptation.Reset();
-      map_load_time = {};
+      map_light_scale = 0.f;
     }
     load_textures = 0;
   }
@@ -912,6 +901,7 @@ void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain*
   shader_injection.scene_post_drawn = 0.f;
   bloom_chain_drawn = false;
   histogram_drawn_last_frame = histogram_drawn;
+  light_scale_last_frame = current_light_scale;
   histogram_drawn = false;
   raw_scene_tone_mapped = false;
   perspective_drawn = false;
