@@ -42,6 +42,13 @@ struct EyeAdaptation {
     Advance();
   }
 
+  void Reset() {
+    exposure = 1.f;
+    goal_ = 1.f;
+    target_count_ = 0;
+    last_time_ = {};
+  }
+
   void Release() {
     if (sample_texture_ != nullptr) sample_texture_->Release();
     sample_texture_ = nullptr;

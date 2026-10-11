@@ -337,9 +337,34 @@ float current_light_scale = 1.f;
 bool light_scale_used = false;
 
 sourceengine::EyeAdaptation eye_adaptation;
+float max_map_exposure = 0.f;
+uint32_t textures_created_since_present = 0;
+std::chrono::steady_clock::time_point map_load_time{};
+
+bool IsMapTexture(const reshade::api::resource_desc& desc) {
+  return desc.type == reshade::api::resource_type::texture_2d && desc.texture.width >= 64 && desc.texture.height >= 64;
+}
+
+uint32_t textures_destroyed_since_present = 0;
+std::mutex map_textures_mutex;
+std::unordered_set<uint64_t> map_textures;
+
+void OnInitResource(reshade::api::device* device, const reshade::api::resource_desc& desc, const reshade::api::subresource_data*, reshade::api::resource_usage, reshade::api::resource resource) {
+  if (device->get_api() != reshade::api::device_api::d3d9 || !IsMapTexture(desc)) return;
+  ++textures_created_since_present;
+  std::scoped_lock lock(map_textures_mutex);
+  map_textures.insert(resource.handle);
+}
+
+void OnDestroyMapTexture(reshade::api::device* device, reshade::api::resource resource) {
+  if (device->get_api() != reshade::api::device_api::d3d9) return;
+  std::scoped_lock lock(map_textures_mutex);
+  if (map_textures.erase(resource.handle) != 0) ++textures_destroyed_since_present;
+}
 
 float SceneExposureFor(float light_scale) {
-  return light_scale > 0.f ? eye_adaptation.exposure / light_scale : eye_adaptation.exposure;
+  const float exposure = std::max(max_map_exposure, eye_adaptation.exposure);
+  return light_scale > 0.f ? exposure / light_scale : exposure;
 }
 
 IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
@@ -364,6 +389,9 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   device->StretchRect(source, nullptr, keep, nullptr, D3DTEXF_NONE);
   keep->Release();
   eye_adaptation.Update(device, untonemapped_texture, current_light_scale);
+  if (std::chrono::steady_clock::now() - map_load_time > std::chrono::milliseconds(2500)) {
+    max_map_exposure = std::max(max_map_exposure, eye_adaptation.exposure);
+  }
   return source;
 }
 
@@ -853,8 +881,19 @@ void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain*
       target->Release();
     }
   }
-  if (static uint32_t frames_without_histogram = 0; perspective_drawn && !histogram_drawn) {
-    if (++frames_without_histogram >= 120) light_scale_used = false;
+  const bool map_loaded = textures_created_since_present >= 40 || textures_destroyed_since_present >= 40;
+  textures_created_since_present = 0;
+  textures_destroyed_since_present = 0;
+  if (static uint32_t frames_without_histogram = 0; !histogram_drawn || map_loaded) {
+    if (map_loaded || ++frames_without_histogram >= 30) {
+      frames_without_histogram = 0;
+      light_scale_used = false;
+      max_map_exposure = 0.f;
+      if (map_loaded) {
+        eye_adaptation.Reset();
+        map_load_time = std::chrono::steady_clock::now();
+      }
+    }
   } else {
     frames_without_histogram = 0;
   }
@@ -1498,6 +1537,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         }
 
         reshade::register_event<reshade::addon_event::present>(OnScenePresent);
+        reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
+        reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyMapTexture);
         reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
         reshade::register_event<reshade::addon_event::draw>(OnDraw);
         reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
