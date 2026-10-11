@@ -342,7 +342,7 @@ uint32_t textures_created_since_present = 0;
 std::chrono::steady_clock::time_point map_load_time{};
 
 bool IsMapTexture(const reshade::api::resource_desc& desc) {
-  return desc.type == reshade::api::resource_type::texture_2d && desc.texture.width >= 64 && desc.texture.height >= 64;
+  return desc.type == reshade::api::resource_type::texture_2d && desc.texture.width >= 128 && desc.texture.height >= 128;
 }
 
 uint32_t textures_destroyed_since_present = 0;
@@ -389,7 +389,10 @@ IDirect3DSurface9* CaptureSceneCopy(IDirect3DDevice9* device) {
   device->StretchRect(source, nullptr, keep, nullptr, D3DTEXF_NONE);
   keep->Release();
   eye_adaptation.Update(device, untonemapped_texture, current_light_scale);
-  if (std::chrono::steady_clock::now() - map_load_time > std::chrono::milliseconds(2500)) {
+  const auto now = std::chrono::steady_clock::now();
+  if (map_load_time.time_since_epoch().count() == 0) map_load_time = now;
+  const auto since_load = now - map_load_time;
+  if (since_load > std::chrono::milliseconds(2500) && since_load <= std::chrono::milliseconds(5000)) {
     max_map_exposure = std::max(max_map_exposure, eye_adaptation.exposure);
   }
   return source;
@@ -881,21 +884,28 @@ void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain*
       target->Release();
     }
   }
-  const bool map_loaded = textures_created_since_present >= 40 || textures_destroyed_since_present >= 40;
+  static bool perspective_drawn_last_frame = false;
+  static uint32_t load_textures = 0;
+  if (!perspective_drawn || !perspective_drawn_last_frame) {
+    load_textures += textures_created_since_present + textures_destroyed_since_present;
+  }
   textures_created_since_present = 0;
   textures_destroyed_since_present = 0;
-  if (static uint32_t frames_without_histogram = 0; !histogram_drawn || map_loaded) {
-    if (map_loaded || ++frames_without_histogram >= 30) {
-      frames_without_histogram = 0;
+  perspective_drawn_last_frame = perspective_drawn;
+  if (perspective_drawn) {
+    if (load_textures >= 150) {
       light_scale_used = false;
       max_map_exposure = 0.f;
-      if (map_loaded) {
-        eye_adaptation.Reset();
-        map_load_time = std::chrono::steady_clock::now();
-      }
+      eye_adaptation.Reset();
+      map_load_time = {};
     }
-  } else {
+    load_textures = 0;
+  }
+  if (static uint32_t frames_without_histogram = 0; histogram_drawn) {
     frames_without_histogram = 0;
+  } else if (++frames_without_histogram >= 30) {
+    frames_without_histogram = 0;
+    light_scale_used = false;
   }
   shader_injection.scene_tone_mapped = engine_post_drawn ? 1.f : 0.f;
   engine_post_drawn = false;
