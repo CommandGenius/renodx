@@ -65,7 +65,38 @@ bool IsPerspectiveDraw(IDirect3DDevice9* device) {
   return w_row[0] != 0.f || w_row[1] != 0.f || w_row[2] != 0.f;
 }
 
+bool IsOverlayDraw(IDirect3DDevice9* device) {
+  if (IsPerspectiveDraw(device)) return false;
+  float projection[4] = {};
+  device->GetVertexShaderConstantF(8, projection, 1);
+  return std::abs(projection[0]) >= 0.1f;
+}
+
+extern bool raw_scene_tone_mapped;
+
 IDirect3DBaseTexture9* frozen_scene_texture = nullptr;
+float frozen_scene_ratio = 1.f;
+
+float SceneToUiRatio() {
+  return shader_injection.graphics_white_nits > 0.f ? shader_injection.diffuse_white_nits / shader_injection.graphics_white_nits : 1.f;
+}
+
+float overlay_previous_light_scale[4] = {};
+bool overlay_light_scale_set = false;
+
+void SetOverlayLightScale(IDirect3DDevice9* device, bool frozen_scene) {
+  device->GetPixelShaderConstantF(30, overlay_previous_light_scale, 1);
+  const float scale = frozen_scene ? SceneToUiRatio() / frozen_scene_ratio : SceneToUiRatio();
+  const float light_scale[4] = {scale, 16.f * scale, 16.f * scale, std::pow(scale, 1.f / 2.2f)};
+  device->SetPixelShaderConstantF(30, light_scale, 1);
+  overlay_light_scale_set = true;
+}
+
+void RestoreOverlayLightScale(IDirect3DDevice9* device) {
+  if (!overlay_light_scale_set) return;
+  overlay_light_scale_set = false;
+  device->SetPixelShaderConstantF(30, overlay_previous_light_scale, 1);
+}
 
 bool OnUnlitDrawReplace(reshade::api::command_list* cmd_list) {
   auto* device = GetNativeDevice(cmd_list);
@@ -78,8 +109,13 @@ bool OnUnlitDrawReplace(reshade::api::command_list* cmd_list) {
   const bool frozen_scene = texture != nullptr && texture == frozen_scene_texture;
   if (texture != nullptr) texture->Release();
   if (frozen_scene) MarkPostDrawn();
+  if ((engine_post_drawn || raw_scene_tone_mapped) && IsOverlayDraw(device)) SetOverlayLightScale(device, frozen_scene);
   shader_injection.srgb_write_off = (!frozen_scene && srgb_write == 0 && srgb_read == 0 && !IsPerspectiveDraw(device)) ? 1.f : 0.f;
   return true;
+}
+
+void OnUnlitDrawn(reshade::api::command_list* cmd_list) {
+  RestoreOverlayLightScale(GetNativeDevice(cmd_list));
 }
 
 using CreateTextureFunction = HRESULT(STDMETHODCALLTYPE*)(
@@ -636,12 +672,23 @@ template <typename F>
 bool OnGenericDraw(reshade::api::command_list* cmd_list, F&& draw) {
   if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return false;
   auto* device = GetNativeDevice(cmd_list);
-  if (frozen_scene_texture != nullptr && !engine_post_drawn) {
+  if (frozen_scene_texture != nullptr || engine_post_drawn || raw_scene_tone_mapped) {
     IDirect3DBaseTexture9* texture = nullptr;
     device->GetTexture(0, &texture);
-    const bool frozen_scene = texture == frozen_scene_texture;
+    const bool frozen_scene = texture != nullptr && texture == frozen_scene_texture;
     if (texture != nullptr) texture->Release();
-    if (frozen_scene && !IsPerspectiveDraw(device)) MarkPostDrawn();
+    if (frozen_scene && !engine_post_drawn && !IsPerspectiveDraw(device)) MarkPostDrawn();
+    if ((engine_post_drawn || raw_scene_tone_mapped) && IsOverlayDraw(device)) {
+      auto* overlay_state = renodx::utils::shader::GetCurrentState(cmd_list);
+      if (overlay_state != nullptr) {
+        const auto replaced = custom_shaders.find(renodx::utils::shader::GetCurrentPixelShaderHash(overlay_state));
+        if (replaced != custom_shaders.end() && !replaced->second.code.empty()) return false;
+      }
+      SetOverlayLightScale(device, frozen_scene);
+      draw();
+      RestoreOverlayLightScale(device);
+      return true;
+    }
   }
   if (!perspective_drawn || pending_scene_target.handle != 0u) {
     const bool perspective = IsPerspectiveDraw(device);
@@ -851,6 +898,7 @@ bool CopyFromSwapChain(reshade::api::command_list* cmd_list, reshade::api::resou
     auto* copy = reinterpret_cast<IDirect3DBaseTexture9*>(dest_clone);
     if (engine_post_drawn || raw_scene_tone_mapped) {
       frozen_scene_texture = copy;
+      frozen_scene_ratio = SceneToUiRatio();
     } else if (frozen_scene_texture == copy) {
       frozen_scene_texture = nullptr;
     }
@@ -1024,17 +1072,20 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x9D06155A),
     CustomShaderEntry(0xF990E8E5),
     CustomShaderEntry(0x9010CD7F),
+    CustomShaderEntry(0x52788384),
+    CustomShaderEntry(0x7645D5AB),
+    CustomShaderEntry(0x0A04F2A8),
     {0x6236B99B, {.crc32 = 0x6236B99B, .on_draw = &OnUiDraw}},
     {0xCFAFE6F6, {.crc32 = 0xCFAFE6F6, .on_draw = &OnUiDraw}},
     {0x201ADBD3, {.crc32 = 0x201ADBD3, .on_draw = &OnUiDraw}},
     {0x030AF021, {.crc32 = 0x030AF021, .on_draw = &OnUiDraw}},
-    {0x23B789C1, {.crc32 = 0x23B789C1, .code = __0x23B789C1, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
-    {0x0DEE26BF, {.crc32 = 0x0DEE26BF, .code = __0x0DEE26BF, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
-    {0xEE27D62A, {.crc32 = 0xEE27D62A, .code = __0xEE27D62A, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
-    {0xBB6A22F0, {.crc32 = 0xBB6A22F0, .code = __0xBB6A22F0, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
-    {0x20B2481D, {.crc32 = 0x20B2481D, .code = __0x20B2481D, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
-    {0x7BBB7B71, {.crc32 = 0x7BBB7B71, .code = __0x7BBB7B71, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
-    {0x66FF3787, {.crc32 = 0x66FF3787, .code = __0x66FF3787, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw}},
+    {0x23B789C1, {.crc32 = 0x23B789C1, .code = __0x23B789C1, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw, .on_drawn = &OnUnlitDrawn}},
+    {0x0DEE26BF, {.crc32 = 0x0DEE26BF, .code = __0x0DEE26BF, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw, .on_drawn = &OnUnlitDrawn}},
+    {0xEE27D62A, {.crc32 = 0xEE27D62A, .code = __0xEE27D62A, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw, .on_drawn = &OnUnlitDrawn}},
+    {0xBB6A22F0, {.crc32 = 0xBB6A22F0, .code = __0xBB6A22F0, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw, .on_drawn = &OnUnlitDrawn}},
+    {0x20B2481D, {.crc32 = 0x20B2481D, .code = __0x20B2481D, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw, .on_drawn = &OnUnlitDrawn}},
+    {0x7BBB7B71, {.crc32 = 0x7BBB7B71, .code = __0x7BBB7B71, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw, .on_drawn = &OnUnlitDrawn}},
+    {0x66FF3787, {.crc32 = 0x66FF3787, .code = __0x66FF3787, .on_replace = &OnUnlitDrawReplace, .on_draw = &OnUiDraw, .on_drawn = &OnUnlitDrawn}},
     CustomShaderEntryCallback(0x51AF5BEF, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0xAF2589CC, &OnGammaSpaceDrawReplace),
     CustomShaderEntryCallback(0x8837F356, &OnGammaSpaceDrawReplace),
