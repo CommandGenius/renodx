@@ -65,13 +65,20 @@ bool IsPerspectiveDraw(IDirect3DDevice9* device) {
   return w_row[0] != 0.f || w_row[1] != 0.f || w_row[2] != 0.f;
 }
 
+IDirect3DBaseTexture9* frozen_scene_texture = nullptr;
+
 bool OnUnlitDrawReplace(reshade::api::command_list* cmd_list) {
   auto* device = GetNativeDevice(cmd_list);
   DWORD srgb_write = 0;
   DWORD srgb_read = 0;
   device->GetRenderState(D3DRS_SRGBWRITEENABLE, &srgb_write);
   device->GetSamplerState(0, D3DSAMP_SRGBTEXTURE, &srgb_read);
-  shader_injection.srgb_write_off = (srgb_write == 0 && srgb_read == 0 && !IsPerspectiveDraw(device)) ? 1.f : 0.f;
+  IDirect3DBaseTexture9* texture = nullptr;
+  device->GetTexture(0, &texture);
+  const bool frozen_scene = texture != nullptr && texture == frozen_scene_texture;
+  if (texture != nullptr) texture->Release();
+  if (frozen_scene) MarkPostDrawn();
+  shader_injection.srgb_write_off = (!frozen_scene && srgb_write == 0 && srgb_read == 0 && !IsPerspectiveDraw(device)) ? 1.f : 0.f;
   return true;
 }
 
@@ -629,6 +636,13 @@ template <typename F>
 bool OnGenericDraw(reshade::api::command_list* cmd_list, F&& draw) {
   if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return false;
   auto* device = GetNativeDevice(cmd_list);
+  if (frozen_scene_texture != nullptr && !engine_post_drawn) {
+    IDirect3DBaseTexture9* texture = nullptr;
+    device->GetTexture(0, &texture);
+    const bool frozen_scene = texture == frozen_scene_texture;
+    if (texture != nullptr) texture->Release();
+    if (frozen_scene && !IsPerspectiveDraw(device)) MarkPostDrawn();
+  }
   if (!perspective_drawn || pending_scene_target.handle != 0u) {
     const bool perspective = IsPerspectiveDraw(device);
     perspective_drawn |= perspective;
@@ -831,6 +845,14 @@ bool CopyFromSwapChain(reshade::api::command_list* cmd_list, reshade::api::resou
       if (source_rect) log << " src " << std::dec << source_rect->left << "," << source_rect->top << "-" << source_rect->right << "," << source_rect->bottom;
       if (dest_rect) log << " dst " << std::dec << dest_rect->left << "," << dest_rect->top << "-" << dest_rect->right << "," << dest_rect->bottom;
       reshade::log::message(reshade::log::level::warning, log.str().c_str());
+    }
+  }
+  if (SUCCEEDED(hr) && dest_clone != 0u && desc.Width == scene_desc.Width && desc.Height == scene_desc.Height) {
+    auto* copy = reinterpret_cast<IDirect3DBaseTexture9*>(dest_clone);
+    if (engine_post_drawn || raw_scene_tone_mapped) {
+      frozen_scene_texture = copy;
+    } else if (frozen_scene_texture == copy) {
+      frozen_scene_texture = nullptr;
     }
   }
   dest_surface->Release();
