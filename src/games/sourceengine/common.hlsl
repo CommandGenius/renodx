@@ -27,14 +27,22 @@ float3 FramebufferToGammaClamped(float3 fb_color) {
   return saturate(FramebufferToGamma(fb_color));
 }
 
-float3 PsychoVToneMap(float3 untonemapped) {
+float ScenePeak() {
   float peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
   if (RENODX_GAMMA_CORRECTION != 0.f) {
     peak = renodx::color::correct::Gamma(peak, RENODX_GAMMA_CORRECTION > 0.f, abs(RENODX_GAMMA_CORRECTION) == 1.f ? 2.2f : 2.4f);
   }
+  return peak;
+}
+
+float3 SourceToneMap(float3 untonemapped) {
+  return min(untonemapped, ScenePeak());
+}
+
+float3 PsychoVToneMap(float3 untonemapped) {
   return renodx::tonemap::psychov::psychotm_test30(
       untonemapped,
-      peak,
+      ScenePeak(),
       RENODX_TONE_MAP_EXPOSURE,
       RENODX_TONE_MAP_HIGHLIGHTS,
       RENODX_TONE_MAP_SHADOWS,
@@ -62,6 +70,9 @@ float3 ToneMapScene(float3 untonemapped, float3 graded_sdr, float3 neutral_sdr) 
   if (RENODX_TONE_MAP_TYPE == 3.f) {
     return renodx::draw::RenderIntermediatePass(PsychoVToneMap(renodx::draw::ComputeUntonemappedGraded(untonemapped, graded_sdr, neutral_sdr)));
   }
+  if (RENODX_TONE_MAP_TYPE == 4.f) {
+    return renodx::draw::RenderIntermediatePass(SourceToneMap(renodx::draw::ComputeUntonemappedGraded(untonemapped, graded_sdr, neutral_sdr)));
+  }
   return renodx::draw::RenderIntermediatePass(renodx::draw::ToneMapPass(untonemapped, graded_sdr, neutral_sdr));
 }
 
@@ -71,6 +82,9 @@ float3 ToneMapScene(float3 untonemapped) {
   }
   if (RENODX_TONE_MAP_TYPE == 3.f) {
     return renodx::draw::RenderIntermediatePass(PsychoVToneMap(untonemapped));
+  }
+  if (RENODX_TONE_MAP_TYPE == 4.f) {
+    return renodx::draw::RenderIntermediatePass(SourceToneMap(untonemapped));
   }
   return renodx::draw::RenderIntermediatePass(renodx::draw::ToneMapPass(untonemapped));
 }

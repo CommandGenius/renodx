@@ -1161,15 +1161,16 @@ renodx::utils::settings::Settings settings = {
         .key = "ToneMapType",
         .binding = &shader_injection.tone_map_type,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 2.f,
+        .default_value = 3.f,
         .can_reset = true,
         .label = "Tone Mapper",
         .section = "Tone Mapping",
         .tooltip = "Sets the tone mapper type",
-        .labels = {"Vanilla", "None", "PsychoV"},
+        .labels = {"Vanilla", "None", "Vanilla+", "PsychoV"},
         .parse = [](float value) {
           if (value < 0.5f) return 0.f;
           if (value < 1.5f) return 1.f;
+          if (value < 2.5f) return 4.f;
           return 3.f;
         },
         .is_visible = []() { return current_settings_mode >= 1; },
