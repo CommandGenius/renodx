@@ -2,7 +2,6 @@
 #include "./shared.h"
 #include "./tonemap.hlsli"
 
-
 struct Clustered_Params {
   column_major float4x4 clusters_view_proj;
   float3 clusters_count_inv;
@@ -407,7 +406,8 @@ float4 main(
             SV_Position.xy,
             tone_mapper_curve,
             RENODX_TONE_MAP_TYPE,
-            custom_reference);
+            custom_reference,
+            white_point, contrast, 0.f, gain_adjust);
       }
 #endif
     } else {

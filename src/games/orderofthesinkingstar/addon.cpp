@@ -24,6 +24,8 @@ ShaderInjectData shader_injection = {};
 renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x57A0AE0E),  // Scene effects, color grade, and tone map
     CustomShaderEntry(0x7CE8C479),  // FXAA and final scene blit
+    CustomShaderEntry(0x06815A08),  // Updated scene effects, color grade, and tone map
+    CustomShaderEntry(0x7C789067),  // Updated FXAA and final scene blit
 };
 
 renodx::utils::settings::Setting* output_mode_setting = nullptr;
@@ -137,7 +139,7 @@ renodx::utils::settings::Settings settings = {
         .key = "GammaCorrection",
         .binding = &shader_injection.gamma_correction,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f,
+        .default_value = 0.f,
         .label = "SDR EOTF Emulation",
         .section = "Output",
         .tooltip = "Emulates SDR display decoding in HDR output.",
@@ -148,7 +150,7 @@ renodx::utils::settings::Settings settings = {
         .key = "ToneMapTypeV2",
         .binding = &shader_injection.tone_map_type,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f,
+        .default_value = 3.f,
         .label = "Tone Mapper",
         .section = "Grading",
         .tooltip = "Vanilla preserves the original game tone mapper. Neutwo tone-maps its output-18% tangent extension. PsychoV can use the vanilla output-18% exposure and positive-inflection slope.",
@@ -316,6 +318,18 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = &IsPsychoV30Enabled,
     },
     new renodx::utils::settings::Setting{
+        .key = "FxGameHueClip",
+        .binding = &shader_injection.custom_hue_clip,
+        .default_value = 50.f,
+        .label = "Hue Clip Emulation",
+        .section = "Effects",
+        .min = 0.f,
+        .max = 100.f,
+        .format = "%.0f",
+        .is_enabled = &IsCustomToneMapperEnabled,
+        .parse = [](float value) { return value * 0.01f; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "FxGameSaturationSpace",
         .binding = &shader_injection.custom_saturation_space,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -435,6 +449,7 @@ void OnPresetOff() {
       {"FxGameLiftV2", 50.f},
       {"FxGameGammaV2", 50.f},
       {"FxGameGainV2", 50.f},
+      {"FxGameHueClip", 0.f},
       {"ColorGradeHighlightSaturation", 50.f},
       {"ColorGradeBlowout", 0.f},
       {"ColorGradeFlare", 0.f},
