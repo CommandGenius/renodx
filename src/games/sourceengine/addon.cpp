@@ -40,6 +40,12 @@ bool bloom_chain_drawn = false;
 bool histogram_drawn = false;
 bool histogram_drawn_last_frame = false;
 bool perspective_drawn = false;
+uint32_t draw_index = 0;
+uint32_t two_d_run_start = 0;
+uint32_t two_d_run_length = 0;
+uint32_t hud_start = 0;
+uint32_t hud_start_last_frame = 0;
+constexpr uint32_t HUD_RUN_LENGTH = 8;
 
 bool OnBloomDownsampleReplace(reshade::api::command_list* cmd_list) {
   bloom_chain_drawn = true;
@@ -73,9 +79,31 @@ bool IsOverlayDraw(IDirect3DDevice9* device) {
 }
 
 extern bool raw_scene_tone_mapped;
+HRESULT CurrentRenderTarget(IDirect3DDevice9* device, IDirect3DSurface9** target);
+void TonemapRawScene(IDirect3DDevice9* device, IDirect3DSurface9* target, const D3DSURFACE_DESC& desc);
 
 IDirect3DBaseTexture9* frozen_scene_texture = nullptr;
 float frozen_scene_ratio = 1.f;
+bool frozen_scene_raw = false;
+bool frozen_scene_pending = false;
+IDirect3DBaseTexture9* frozen_scene_candidate = nullptr;
+bool check_3d_after_copy = false;
+bool drew_3d_after_copy = false;
+
+bool IsFrozenRawDraw(IDirect3DDevice9* device, bool frozen_scene) {
+  return frozen_scene && frozen_scene_raw && !perspective_drawn && !histogram_drawn && !raw_scene_tone_mapped && !IsPerspectiveDraw(device);
+}
+
+void TonemapFrozenScene(IDirect3DDevice9* device) {
+  if (!frozen_scene_pending) return;
+  frozen_scene_pending = false;
+  IDirect3DSurface9* target = nullptr;
+  if (FAILED(CurrentRenderTarget(device, &target)) || target == nullptr) return;
+  D3DSURFACE_DESC desc = {};
+  target->GetDesc(&desc);
+  if (desc.Format == D3DFMT_A16B16G16R16F) TonemapRawScene(device, target, desc);
+  target->Release();
+}
 
 float SceneToUiRatio() {
   return shader_injection.graphics_white_nits > 0.f ? shader_injection.diffuse_white_nits / shader_injection.graphics_white_nits : 1.f;
@@ -108,14 +136,20 @@ bool OnUnlitDrawReplace(reshade::api::command_list* cmd_list) {
   device->GetTexture(0, &texture);
   const bool frozen_scene = texture != nullptr && texture == frozen_scene_texture;
   if (texture != nullptr) texture->Release();
-  if (frozen_scene) MarkPostDrawn();
-  if ((engine_post_drawn || raw_scene_tone_mapped) && IsOverlayDraw(device)) SetOverlayLightScale(device, frozen_scene);
+  if (IsFrozenRawDraw(device, frozen_scene)) {
+    frozen_scene_pending = true;
+  } else {
+    if (frozen_scene) MarkPostDrawn();
+    if ((engine_post_drawn || raw_scene_tone_mapped) && IsOverlayDraw(device)) SetOverlayLightScale(device, frozen_scene);
+  }
   shader_injection.srgb_write_off = (!frozen_scene && srgb_write == 0 && srgb_read == 0 && !IsPerspectiveDraw(device)) ? 1.f : 0.f;
   return true;
 }
 
 void OnUnlitDrawn(reshade::api::command_list* cmd_list) {
-  RestoreOverlayLightScale(GetNativeDevice(cmd_list));
+  auto* device = GetNativeDevice(cmd_list);
+  RestoreOverlayLightScale(device);
+  TonemapFrozenScene(device);
 }
 
 using CreateTextureFunction = HRESULT(STDMETHODCALLTYPE*)(
@@ -259,6 +293,7 @@ float bloom_factor[4] = {};
 IDirect3DPixelShader9* encode_scene_shader = nullptr;
 IDirect3DPixelShader9* post_upgrade_shader = nullptr;
 IDirect3DPixelShader9* copy_scene_shader = nullptr;
+IDirect3DPixelShader9* restore_scene_shader = nullptr;
 IDirect3DDevice9* post_shader_device = nullptr;
 
 IDirect3DTexture9* MatchTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture, const D3DSURFACE_DESC& desc) {
@@ -274,7 +309,7 @@ IDirect3DTexture9* MatchTexture(IDirect3DDevice9* device, IDirect3DTexture9* tex
 
 IDirect3DPixelShader9* PostShader(IDirect3DDevice9* device, IDirect3DPixelShader9** shader, std::span<const uint8_t> code) {
   if (post_shader_device != device) {
-    for (auto** stale : {&encode_scene_shader, &post_upgrade_shader, &copy_scene_shader}) {
+    for (auto** stale : {&encode_scene_shader, &post_upgrade_shader, &copy_scene_shader, &restore_scene_shader}) {
       if (*stale != nullptr) (*stale)->Release();
       *stale = nullptr;
     }
@@ -346,6 +381,8 @@ class FullscreenPass {
 
   void Draw(const float* constants_c0 = nullptr) {
     if (state_ == nullptr) return;
+    static_assert(sizeof(shader_injection) % sizeof(float[4]) == 0);
+    device_->SetPixelShaderConstantF(210, reinterpret_cast<const float*>(&shader_injection), sizeof(shader_injection) / sizeof(float[4]));
     if (constants_c0 != nullptr) device_->SetPixelShaderConstantF(0, constants_c0, 1);
     const float quad[4][6] = {
         {-0.5f, -0.5f, 0.f, 1.f, 0.f, 0.f},
@@ -454,6 +491,32 @@ void TonemapRawScene(IDirect3DDevice9* device, IDirect3DSurface9* target, const 
   }
 }
 
+bool previous_frame_tone_mapped = false;
+
+void RestoreStaleScene(IDirect3DDevice9* device) {
+  IDirect3DSurface9* target = nullptr;
+  if (FAILED(CurrentRenderTarget(device, &target)) || target == nullptr) return;
+  IDirect3DSurface9* back_buffer = nullptr;
+  D3DSURFACE_DESC back_buffer_desc = {};
+  if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back_buffer)) && back_buffer != nullptr) {
+    back_buffer->GetDesc(&back_buffer_desc);
+    back_buffer->Release();
+  }
+  D3DSURFACE_DESC desc = {};
+  target->GetDesc(&desc);
+  if (desc.Format == D3DFMT_A16B16G16R16F && desc.Width == back_buffer_desc.Width && desc.Height == back_buffer_desc.Height) {
+    untonemapped_texture = MatchTexture(device, untonemapped_texture, desc);
+    IDirect3DSurface9* scratch = nullptr;
+    if (untonemapped_texture != nullptr && SUCCEEDED(untonemapped_texture->GetSurfaceLevel(0, &scratch))) {
+      device->StretchRect(target, nullptr, scratch, nullptr, D3DTEXF_NONE);
+      scratch->Release();
+      IDirect3DBaseTexture9* inputs[] = {untonemapped_texture};
+      DrawFullscreen(device, PostShader(device, &restore_scene_shader, __restore_scene), inputs, target);
+    }
+  }
+  target->Release();
+}
+
 bool OnUiDraw(reshade::api::command_list* cmd_list) {
   if (engine_post_drawn || bloom_chain_drawn || raw_scene_tone_mapped) return true;
   auto* device = GetNativeDevice(cmd_list);
@@ -479,7 +542,7 @@ bool OnUiDraw(reshade::api::command_list* cmd_list) {
       source->Release();
     }
     const bool stencil_test = (stencil != 0 && (stencil_func == D3DCMP_EQUAL || stencil_func == D3DCMP_NOTEQUAL)) || render_target_source;
-    if (!perspective_drawn || !vgui || histogram_drawn_last_frame || stencil_test) return true;
+    if (!perspective_drawn || !vgui || histogram_drawn_last_frame || stencil_test || draw_index < hud_start_last_frame) return true;
   }
   IDirect3DSurface9* target = nullptr;
   if (FAILED(CurrentRenderTarget(device, &target)) || target == nullptr) return true;
@@ -672,18 +735,38 @@ template <typename F>
 bool OnGenericDraw(reshade::api::command_list* cmd_list, F&& draw) {
   if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return false;
   auto* device = GetNativeDevice(cmd_list);
-  if (frozen_scene_texture != nullptr || engine_post_drawn || raw_scene_tone_mapped) {
+  ++draw_index;
+  const bool perspective_draw = IsPerspectiveDraw(device);
+  auto* draw_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  const bool has_pixel_shader = draw_state != nullptr && renodx::utils::shader::GetCurrentPixelShaderHash(draw_state) != 0u;
+  if (perspective_draw) {
+    two_d_run_length = 0;
+  } else if (has_pixel_shader) {
+    if (two_d_run_length++ == 0) two_d_run_start = draw_index;
+    if (two_d_run_length >= HUD_RUN_LENGTH && hud_start == 0) hud_start = two_d_run_start;
+  }
+  if (check_3d_after_copy && perspective_draw) {
+    drew_3d_after_copy = true;
+    check_3d_after_copy = false;
+  }
+  if (frozen_scene_texture != nullptr || frozen_scene_candidate != nullptr || engine_post_drawn || raw_scene_tone_mapped) {
     IDirect3DBaseTexture9* texture = nullptr;
     device->GetTexture(0, &texture);
     const bool frozen_scene = texture != nullptr && texture == frozen_scene_texture;
+    if (texture != nullptr && texture == frozen_scene_candidate) frozen_scene_candidate = nullptr;
     if (texture != nullptr) texture->Release();
+    const auto replaced = draw_state != nullptr ? custom_shaders.find(renodx::utils::shader::GetCurrentPixelShaderHash(draw_state)) : custom_shaders.end();
+    const bool self_handled = replaced != custom_shaders.end() && !replaced->second.code.empty();
+    if (IsFrozenRawDraw(device, frozen_scene)) {
+      frozen_scene_pending = true;
+      if (self_handled) return false;
+      draw();
+      TonemapFrozenScene(device);
+      return true;
+    }
     if (frozen_scene && !engine_post_drawn && !IsPerspectiveDraw(device)) MarkPostDrawn();
     if ((engine_post_drawn || raw_scene_tone_mapped) && IsOverlayDraw(device)) {
-      auto* overlay_state = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (overlay_state != nullptr) {
-        const auto replaced = custom_shaders.find(renodx::utils::shader::GetCurrentPixelShaderHash(overlay_state));
-        if (replaced != custom_shaders.end() && !replaced->second.code.empty()) return false;
-      }
+      if (self_handled) return false;
       SetOverlayLightScale(device, frozen_scene);
       draw();
       RestoreOverlayLightScale(device);
@@ -691,9 +774,10 @@ bool OnGenericDraw(reshade::api::command_list* cmd_list, F&& draw) {
     }
   }
   if (!perspective_drawn || pending_scene_target.handle != 0u) {
-    const bool perspective = IsPerspectiveDraw(device);
-    perspective_drawn |= perspective;
-    if (pending_scene_target.handle != 0u) ActivateSceneTarget(cmd_list, device, perspective);
+    const bool scene_start = perspective_draw && !perspective_drawn;
+    perspective_drawn |= perspective_draw;
+    if (pending_scene_target.handle != 0u) ActivateSceneTarget(cmd_list, device, perspective_draw);
+    if (scene_start && previous_frame_tone_mapped) RestoreStaleScene(device);
   }
   if (perspective_drawn && !histogram_drawn) {
     float light_scale[4] = {1.f, 1.f, 1.f, 1.f};
@@ -756,7 +840,7 @@ void OnDestroyDevice(reshade::api::device* device) {
     if (*texture != nullptr) (*texture)->Release();
     *texture = nullptr;
   }
-  for (auto** shader : {&encode_scene_shader, &post_upgrade_shader, &copy_scene_shader}) {
+  for (auto** shader : {&encode_scene_shader, &post_upgrade_shader, &copy_scene_shader, &restore_scene_shader}) {
     if (*shader != nullptr) (*shader)->Release();
     *shader = nullptr;
   }
@@ -899,8 +983,13 @@ bool CopyFromSwapChain(reshade::api::command_list* cmd_list, reshade::api::resou
     if (engine_post_drawn || raw_scene_tone_mapped) {
       frozen_scene_texture = copy;
       frozen_scene_ratio = SceneToUiRatio();
-    } else if (frozen_scene_texture == copy) {
-      frozen_scene_texture = nullptr;
+      frozen_scene_raw = false;
+      frozen_scene_candidate = nullptr;
+    } else {
+      frozen_scene_candidate = copy;
+      check_3d_after_copy = true;
+      drew_3d_after_copy = false;
+      if (frozen_scene_texture == copy && !frozen_scene_raw) frozen_scene_texture = nullptr;
     }
   }
   dest_surface->Release();
@@ -936,6 +1025,14 @@ bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::
 void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect* source_rect, const reshade::api::rect* dest_rect, uint32_t dirty_rect_count, const reshade::api::rect* dirty_rects) {
   if (queue->get_device()->get_api() != reshade::api::device_api::d3d9) return;
   auto* device = reinterpret_cast<IDirect3DDevice9*>(queue->get_device()->get_native());
+  if (frozen_scene_candidate != nullptr) {
+    if (perspective_drawn && !drew_3d_after_copy && !histogram_drawn) {
+      frozen_scene_texture = frozen_scene_candidate;
+      frozen_scene_raw = true;
+    }
+    frozen_scene_candidate = nullptr;
+    check_3d_after_copy = false;
+  }
   if (!histogram_drawn && !engine_post_drawn && !raw_scene_tone_mapped && perspective_drawn) {
     IDirect3DSurface9* target = nullptr;
     if (SUCCEEDED(CurrentRenderTarget(device, &target)) && target != nullptr) {
@@ -967,10 +1064,15 @@ void OnScenePresent(reshade::api::command_queue* queue, reshade::api::swapchain*
     light_scale_used = false;
   }
   shader_injection.scene_tone_mapped = engine_post_drawn ? 1.f : 0.f;
+  previous_frame_tone_mapped = engine_post_drawn;
   engine_post_drawn = false;
   shader_injection.scene_post_drawn = 0.f;
   bloom_chain_drawn = false;
   histogram_drawn_last_frame = histogram_drawn;
+  hud_start_last_frame = hud_start;
+  hud_start = 0;
+  two_d_run_length = 0;
+  draw_index = 0;
   light_scale_last_frame = current_light_scale;
   histogram_drawn = false;
   raw_scene_tone_mapped = false;
