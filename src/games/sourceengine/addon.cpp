@@ -1166,6 +1166,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     ENGINE_POST_SHADER(0xE437F066),
     {0xC5D92350, {.crc32 = 0xC5D92350, .code = __0xC5D92350, .on_replace = &OnBloomAddReplace, .on_drawn = &OnBloomAddDrawn}},
     CustomShaderEntry(0xD04DC500),
+    CustomShaderEntry(0xB38DEF15),
     {0x8B8861AD, {.crc32 = 0x8B8861AD, .code = __0x8B8861AD, .on_replace = &OnLuminanceCompareReplace}},
     CustomShaderEntryCallback(0x5C3593EB, &OnBloomDownsampleReplace),
     ENGINE_POST_SHADER(0x831313E4),
