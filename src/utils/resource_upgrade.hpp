@@ -21,6 +21,7 @@
 #include "./data.hpp"
 #include "./descriptor.hpp"
 #include "./log.hpp"
+#include "./opengl.hpp"
 #include "./resource.hpp"
 #include "./swapchain.hpp"
 
@@ -830,7 +831,13 @@ inline void RewriteRenderTargets(
   auto* new_rtvs = ApplyRenderTargetClones(rtvs, count);
   if (new_rtvs == nullptr) return;
   if (cmd_list->get_device()->get_api() == reshade::api::device_api::opengl) {
+    renodx::utils::opengl::Initialize();
+    int read_framebuffer = 0;
+    renodx::utils::opengl::pGlGetIntegerv(renodx::utils::opengl::READ_FRAMEBUFFER_BINDING, &read_framebuffer);
     cmd_list->bind_render_targets_and_depth_stencil(count, new_rtvs, {0u});
+    // ReShade binds GL_FRAMEBUFFER (READ and DRAW). Only DRAW is redirected;
+    // preserve the game's source for a subsequent framebuffer blit.
+    renodx::utils::opengl::pGlBindFramebuffer(renodx::utils::opengl::READ_FRAMEBUFFER, static_cast<unsigned int>(read_framebuffer));
   } else {
     cmd_list->bind_render_targets_and_depth_stencil(count, new_rtvs, dsv);
   }
@@ -2149,7 +2156,6 @@ inline bool OnCreateResourceView(
     case reshade::api::resource_view_type::texture_cube_array:
       break;
     case reshade::api::resource_view_type::buffer:
-      if (is_vulkan) break;
       return false;
     case reshade::api::resource_view_type::unknown:
       assert(false);
@@ -2270,7 +2276,15 @@ inline bool OnCreateResourceView(
     }
   } else {
     // Resource upgrades in general may cause format mismatches
-    if (typeless_resource_format != typeless_view_format) {
+    // ReShade encodes these Vulkan component mappings as distinct view formats.
+    const bool is_vulkan_component_mapped_view = is_vulkan
+      && ((current_desc.format == reshade::api::format::a8_unorm
+         && resource_desc.texture.format == reshade::api::format::r8_unorm)
+        || (current_desc.format == reshade::api::format::b8g8r8x8_unorm
+          && resource_desc.texture.format == reshade::api::format::b8g8r8a8_unorm)
+        || (current_desc.format == reshade::api::format::b8g8r8x8_unorm_srgb
+          && resource_desc.texture.format == reshade::api::format::b8g8r8a8_unorm_srgb));
+    if (typeless_resource_format != typeless_view_format && !is_vulkan_component_mapped_view) {
       if (resource_desc.texture.format != typeless_resource_format) {
         switch (resource_desc.texture.format) {
           case reshade::api::format::r8g8b8a8_unorm:
