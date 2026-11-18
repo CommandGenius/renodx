@@ -754,6 +754,7 @@ bool OnGenericDraw(reshade::api::command_list* cmd_list, F&& draw) {
     device->GetTexture(0, &texture);
     const bool frozen_scene = texture != nullptr && texture == frozen_scene_texture;
     if (texture != nullptr && texture == frozen_scene_candidate) frozen_scene_candidate = nullptr;
+    const bool reads_scene_copy = texture != nullptr && texture == scene_copy_texture;
     if (texture != nullptr) texture->Release();
     const auto replaced = draw_state != nullptr ? custom_shaders.find(renodx::utils::shader::GetCurrentPixelShaderHash(draw_state)) : custom_shaders.end();
     const bool self_handled = replaced != custom_shaders.end() && !replaced->second.code.empty();
@@ -765,6 +766,13 @@ bool OnGenericDraw(reshade::api::command_list* cmd_list, F&& draw) {
       return true;
     }
     if (frozen_scene && !engine_post_drawn && !IsPerspectiveDraw(device)) MarkPostDrawn();
+    if (engine_post_drawn && !self_handled && !perspective_draw && reads_scene_copy && untonemapped_texture != nullptr && histogram_drawn
+        && EncodedScene(device) != nullptr) {
+      SwapTextureSlot(device, 0, encoded_texture);
+      draw();
+      RestoreTextureSlot(device, 0);
+      return true;
+    }
     if ((engine_post_drawn || raw_scene_tone_mapped) && IsOverlayDraw(device)) {
       if (self_handled) return false;
       SetOverlayLightScale(device, frozen_scene);
@@ -1157,6 +1165,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     ENGINE_POST_SHADER(0xCEA2627C),
     ENGINE_POST_SHADER(0xE437F066),
     {0xC5D92350, {.crc32 = 0xC5D92350, .code = __0xC5D92350, .on_replace = &OnBloomAddReplace, .on_drawn = &OnBloomAddDrawn}},
+    CustomShaderEntry(0xD04DC500),
     {0x8B8861AD, {.crc32 = 0x8B8861AD, .code = __0x8B8861AD, .on_replace = &OnLuminanceCompareReplace}},
     CustomShaderEntryCallback(0x5C3593EB, &OnBloomDownsampleReplace),
     ENGINE_POST_SHADER(0x831313E4),
@@ -1491,7 +1500,7 @@ renodx::utils::settings::Settings settings = {
         .key = "SwapChainGammaCorrection",
         .binding = &shader_injection.swap_chain_gamma_correction,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
+        .default_value = 1.f,
         .label = "Gamma Correction",
         .section = "Display Output",
         .labels = {"None", "2.2", "2.4"},
